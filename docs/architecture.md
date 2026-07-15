@@ -305,11 +305,11 @@ message RoutedRequest {
 
 ```mermaid
 graph TD
-    REQ[RoutedRequest 到达 Node]
-    CHK1{destination_node<br/>是当前 Node?}
-    CHK2{destination_leaf<br/>存在?}
-    CHK3{hop_limit > 0?}
-    CHK4{目标 Node 已知?}
+    REQ["RoutedRequest 到达 Node"]
+    CHK1{"destination_node<br/>是当前 Node?"}
+    CHK2{"destination_leaf<br/>存在?"}
+    CHK3{"hop_limit > 0?"}
+    CHK4{"目标 Node 已知?"}
     S1[转发给目标 Leaf]
     S2[返回错误: leaf_not_found]
     S3[返回错误: hop_limit_exceeded]
@@ -350,9 +350,9 @@ graph TD
 
 ```mermaid
 graph TD
-    PICK[pick(service, metadata)]
+    PICK["pick(service, metadata)"]
     SHARD{有 shard_key?}
-    HASH[shard_key 哈希<br/>选固定 endpoint]
+    HASH["shard_key 哈希<br/>选固定 endpoint"]
     STICKY{sticky?}
     HAS_SID{有 sid?}
     CACHED{缓存命中?}
