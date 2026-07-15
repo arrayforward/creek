@@ -351,6 +351,8 @@ flowchart TD
 ```mermaid
 flowchart TD
     PICK[pick(service, metadata)]
+    SHARD{有 shard_key?}
+    HASH[shard_key 哈希<br/>选固定 endpoint]
     STICKY{sticky?}
     HAS_SID{有 sid?}
     CACHED{缓存命中?}
@@ -359,7 +361,10 @@ flowchart TD
     REBIND[重新绑定]
     RET[返回 Endpoint]
 
-    PICK --> STICKY
+    PICK --> SHARD
+    SHARD -->|是| HASH
+    SHARD -->|否| STICKY
+    HASH --> RET
     STICKY -->|否| RR
     STICKY -->|是| HAS_SID
     HAS_SID -->|否| RR

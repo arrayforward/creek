@@ -334,7 +334,7 @@ public:
 
     mutable std::mutex send_mutex;
     std::condition_variable send_cv;
-    std::deque<std::pair<std::string, Bytes>> send_queue;
+    std::map<int, std::deque<std::pair<std::string, Bytes>>> send_queue;
 
     mutable std::mutex peers_mutex;
 
@@ -558,12 +558,14 @@ public:
         return true;
     }
 
-    bool send_message(const std::string& peer_id, Bytes payload) {
+    bool send_message(const std::string& peer_id, Bytes payload, int priority = 0) {
         if (!running.load()) return false;
         {
             std::lock_guard<std::mutex> lock(send_mutex);
-            if (send_queue.size() >= config.queue_limit) return false;
-            send_queue.emplace_back(peer_id, std::move(payload));
+            std::size_t total = 0;
+            for (const auto& kv : send_queue) total += kv.second.size();
+            if (total >= config.queue_limit) return false;
+            send_queue[priority].emplace_back(peer_id, std::move(payload));
         }
         send_cv.notify_one();
         return true;
@@ -1042,37 +1044,39 @@ public:
     }
 
     void process_send_queue() {
-        std::deque<std::pair<std::string, Bytes>> local;
-        std::deque<std::pair<std::string, Bytes>> deferred;
+        std::map<int, std::deque<std::pair<std::string, Bytes>>> local;
         {
             std::lock_guard<std::mutex> lock(send_mutex);
             local.swap(send_queue);
         }
-        while (!local.empty()) {
-            auto item = std::move(local.front());
-            local.pop_front();
-            std::lock_guard<std::mutex> lock(peers_mutex);
-            auto it = peers.find(item.first);
-            if (it == peers.end()) {
-                it = std::find_if(peers.begin(), peers.end(), [&](const auto& entry) {
-                    return entry.second.id == item.first;
-                });
-            }
-            if (it == peers.end()) continue;
-            auto& peer = it->second;
-            if (peer.state != LinkState::Online) {
-                if (peer.state != LinkState::Closed) {
-                    deferred.push_back(std::move(item));
+        for (auto it = local.rbegin(); it != local.rend(); ++it) {
+            auto& queue = it->second;
+            while (!queue.empty()) {
+                auto item = std::move(queue.front());
+                queue.pop_front();
+                std::lock_guard<std::mutex> lock(peers_mutex);
+                auto pit = peers.find(item.first);
+                if (pit == peers.end()) {
+                    pit = std::find_if(peers.begin(), peers.end(), [&](const auto& entry) {
+                        return entry.second.id == item.first;
+                    });
                 }
-                continue;
-            }
-            fragment_and_send(&peer, std::move(item.second));
-        }
-        if (!deferred.empty()) {
-            std::lock_guard<std::mutex> lock(send_mutex);
-            while (!deferred.empty() && send_queue.size() < config.queue_limit) {
-                send_queue.push_back(std::move(deferred.front()));
-                deferred.pop_front();
+                if (pit == peers.end()) continue;
+                auto& peer = pit->second;
+                if (peer.state != LinkState::Online) {
+                    if (peer.state != LinkState::Closed) {
+                        std::lock_guard<std::mutex> lk(send_mutex);
+                        if ([&]() {
+                            std::size_t total = 0;
+                            for (const auto& kv : send_queue) total += kv.second.size();
+                            return total;
+                        }() < config.queue_limit) {
+                            send_queue[it->first].push_back(std::move(item));
+                        }
+                    }
+                    continue;
+                }
+                fragment_and_send(&peer, std::move(item.second));
             }
         }
     }
@@ -1168,7 +1172,11 @@ bool TightTransport::connect(const RemotePeer& remote) {
 }
 
 bool TightTransport::send(const std::string& peer_id, Bytes payload) {
-    return impl_->send_message(peer_id, std::move(payload));
+    return impl_->send_message(peer_id, std::move(payload), 0);
+}
+
+bool TightTransport::send_priority(const std::string& peer_id, Bytes payload, int priority) {
+    return impl_->send_message(peer_id, std::move(payload), priority);
 }
 
 std::vector<PeerEvent> TightTransport::peers() const {

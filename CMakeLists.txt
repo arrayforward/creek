@@ -16,6 +16,28 @@ find_package(GTest CONFIG REQUIRED)
 find_package(Threads REQUIRED)
 find_package(Python3 COMPONENTS Interpreter)
 
+find_path(CREEK_OPENSSL_INCLUDE_DIR
+    NAMES openssl/evp.h
+    PATHS
+        "D:/msys64/mingw64/include"
+        "C:/msys64/mingw64/include"
+)
+find_library(CREEK_OPENSSL_SSL_LIBRARY
+    NAMES ssl
+    PATHS
+        "D:/msys64/mingw64/lib"
+        "C:/msys64/mingw64/lib"
+)
+find_library(CREEK_OPENSSL_CRYPTO_LIBRARY
+    NAMES crypto
+    PATHS
+        "D:/msys64/mingw64/lib"
+        "C:/msys64/mingw64/lib"
+)
+if(NOT CREEK_OPENSSL_INCLUDE_DIR OR NOT CREEK_OPENSSL_SSL_LIBRARY OR NOT CREEK_OPENSSL_CRYPTO_LIBRARY)
+    message(FATAL_ERROR "OpenSSL not found at D:/msys64/mingw64 or C:/msys64/mingw64")
+endif()
+
 find_path(CREEK_HIREDIS_INCLUDE_DIR
     NAMES hiredis/hiredis.h
     PATHS
@@ -70,7 +92,7 @@ add_library(creek_proto STATIC
     "${CREEK_GRPC_SOURCE}"
 )
 target_include_directories(creek_proto PUBLIC "${CREEK_GENERATED_DIR}")
-target_link_libraries(creek_proto PUBLIC protobuf::libprotobuf gRPC::grpc++)
+target_link_libraries(creek_proto PUBLIC protobuf::libprotobuf gRPC::grpc++ gRPC::grpc++_reflection)
 
 file(GLOB CREEK_CORE_SOURCES CONFIGURE_DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/src/*.cpp")
 add_library(creek_core STATIC ${CREEK_CORE_SOURCES})
@@ -81,8 +103,8 @@ target_link_libraries(creek_core
         nlohmann_json::nlohmann_json
         Threads::Threads
 )
-target_include_directories(creek_core PUBLIC "${CREEK_HIREDIS_INCLUDE_DIR}")
-target_link_libraries(creek_core PUBLIC "${CREEK_HIREDIS_LIBRARY}")
+target_include_directories(creek_core PUBLIC "${CREEK_HIREDIS_INCLUDE_DIR}" "${CREEK_OPENSSL_INCLUDE_DIR}")
+target_link_libraries(creek_core PUBLIC "${CREEK_HIREDIS_LIBRARY}" "${CREEK_OPENSSL_SSL_LIBRARY}" "${CREEK_OPENSSL_CRYPTO_LIBRARY}")
 if(WIN32)
     target_link_libraries(creek_core PRIVATE ws2_32)
 endif()

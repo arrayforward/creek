@@ -11,6 +11,7 @@
 
 #include <grpcpp/grpcpp.h>
 #include <grpcpp/client_context.h>
+#include <grpcpp/ext/proto_server_reflection_plugin.h>
 #include <grpcpp/server_builder.h>
 #include <grpcpp/server_context.h>
 #include <nlohmann/json.hpp>
@@ -561,12 +562,12 @@ public:
                     throw std::runtime_error("redis: no nodes discovered for leaf registration");
                 }
                 std::string picked_node;
-                if (!config_.parent.id.empty()) {
-                    auto it = nodes.find(config_.parent.id);
+                if (!config_.parents.empty() && !config_.parents[0].id.empty()) {
+                    auto it = nodes.find(config_.parents[0].id);
                     if (it == nodes.end()) {
-                        throw std::runtime_error("redis: configured parent node " + config_.parent.id + " not registered");
+                        throw std::runtime_error("redis: configured parent node " + config_.parents[0].id + " not registered");
                     }
-                    picked_node = config_.parent.id;
+                    picked_node = config_.parents[0].id;
                 } else {
                     std::random_device rd;
                     std::mt19937 gen(rd());
@@ -600,8 +601,11 @@ public:
             transport_.reset();
             return false;
         }
-        if (!config_.parent.id.empty()) {
-            transport_->connect(config_.parent);
+        for (const auto& parent : config_.parents) {
+            if (!parent.id.empty()) {
+                parent_ids_.insert(parent.id);
+                transport_->connect(parent);
+            }
         }
 
         metrics_store_ = std::make_shared<MetricsStore>(config_.metric_period);
@@ -637,6 +641,7 @@ public:
         builder.RegisterService(greeter_service_.get());
         builder.RegisterService(leaf_control_service_.get());
         builder.RegisterService(admin_service_.get());
+        grpc::reflection::InitProtoReflectionServerBuilderPlugin();
         grpc_server_ = builder.BuildAndStart();
         if (!grpc_server_) {
             json_rpc_server_->stop();
@@ -693,7 +698,10 @@ public:
     }
 
     void on_message(const std::string& peer_id, Bytes payload) {
-        if (peer_id != config_.parent.id) return;
+        {
+            std::lock_guard<std::mutex> lk(mutex_);
+            if (!parent_ids_.count(peer_id)) return;
+        }
         creek::v1::WireMessage msg;
         if (!parse_wire(payload, msg)) return;
 
@@ -707,7 +715,34 @@ public:
     }
 
     void on_peer_event(const PeerEvent& ev) {
-        (void)ev;
+        std::lock_guard<std::mutex> lk(mutex_);
+        if (!parent_ids_.count(ev.id)) return;
+        if (ev.state == LinkState::Online) {
+            if (active_parent_.empty()) {
+                active_parent_ = ev.id;
+                all_parents_down_.store(false);
+            }
+        } else if (ev.state == LinkState::Closed) {
+            if (ev.id == active_parent_) {
+                active_parent_.clear();
+                bool found = false;
+                for (const auto& parent_id : parent_ids_) {
+                    if (parent_id == ev.id) continue;
+                    auto peers = transport_->peers();
+                    for (const auto& p : peers) {
+                        if (p.id == parent_id && p.state == LinkState::Online) {
+                            active_parent_ = parent_id;
+                            found = true;
+                            break;
+                        }
+                    }
+                    if (found) break;
+                }
+                if (!found) {
+                    all_parents_down_.store(true);
+                }
+            }
+        }
     }
 
     void handle_directory(const creek::v1::DirectorySnapshot& snap, std::size_t raw_size) {
@@ -764,7 +799,10 @@ public:
         creek::v1::RoutedResponse resp;
         resp.set_request_id(req.request_id());
         resp.set_origin_leaf(config_.id);
-        resp.set_origin_node(config_.parent.id);
+        {
+            std::lock_guard<std::mutex> lk(mutex_);
+            resp.set_origin_node(active_parent_.empty() ? (config_.parents.empty() ? std::string{} : config_.parents[0].id) : active_parent_);
+        }
         resp.set_destination_leaf(req.origin_leaf());
         resp.set_destination_node(req.origin_node());
         resp.set_hop_limit(req.hop_limit() > 0 ? req.hop_limit() - 1 : 0);
@@ -803,7 +841,10 @@ public:
         creek::v1::RoutedResponse resp;
         resp.set_request_id(req.request_id());
         resp.set_origin_leaf(config_.id);
-        resp.set_origin_node(config_.parent.id);
+        {
+            std::lock_guard<std::mutex> lk(mutex_);
+            resp.set_origin_node(active_parent_.empty() ? (config_.parents.empty() ? std::string{} : config_.parents[0].id) : active_parent_);
+        }
         resp.set_destination_leaf(req.origin_leaf());
         resp.set_destination_node(req.origin_node());
         resp.set_status(-1);
@@ -816,8 +857,13 @@ public:
         creek::v1::WireMessage wm;
         *wm.mutable_response() = resp;
         Bytes payload = serialize_wire(wm);
-        if (!config_.parent.id.empty()) {
-            transport_->send(config_.parent.id, payload);
+        std::string target;
+        {
+            std::lock_guard<std::mutex> lk(mutex_);
+            target = active_parent_;
+        }
+        if (!target.empty()) {
+            transport_->send(target, payload);
         }
         record_metric("leaf_to_node", "RoutedResponse", payload.size(), 0, true);
     }
@@ -867,7 +913,10 @@ public:
         creek::v1::RoutedRequest out;
         out.set_request_id(random_id());
         out.set_origin_leaf(config_.id);
-        out.set_origin_node(config_.parent.id);
+        {
+            std::lock_guard<std::mutex> lk(mutex_);
+            out.set_origin_node(active_parent_.empty() ? (config_.parents.empty() ? std::string{} : config_.parents[0].id) : active_parent_);
+        }
         out.set_destination_leaf(ep.owner_leaf());
         out.set_destination_node(ep.owner_node());
         out.set_endpoint_id(ep.endpoint_id());
@@ -893,9 +942,18 @@ public:
         Bytes payload = serialize_wire(wm);
         auto send_start = SteadyClock::now();
         bool sent = false;
-        std::string used_target = config_.parent.id;
-        if (!config_.parent.id.empty()) {
-            sent = transport_->send(config_.parent.id, payload);
+        {
+            std::lock_guard<std::mutex> lk(mutex_);
+            if (!active_parent_.empty()) {
+                sent = transport_->send_priority(active_parent_, payload, 1);
+            }
+            if (!sent) {
+                for (const auto& pid : parent_ids_) {
+                    if (pid == active_parent_) continue;
+                    sent = transport_->send_priority(pid, payload, 1);
+                    if (sent) break;
+                }
+            }
         }
         if (!sent) {
             std::string target_addr;
@@ -917,7 +975,7 @@ public:
                 auto parsed = parse_address(target_addr);
                 if (parsed) {
                     transport_->connect({target_id, *parsed});
-                    sent = transport_->send(target_id, payload);
+                    sent = transport_->send_priority(target_id, payload, 1);
                 }
             }
         }
@@ -990,6 +1048,7 @@ public:
         std::string name = params.value("name", std::string{});
         std::string sid_value = params.value("sid", std::string{});
         bool sticky = true;
+        Metadata metadata;
         if (params.contains("sticky") && params["sticky"].is_boolean()) {
             sticky = params["sticky"].get<bool>();
         }
@@ -1002,6 +1061,9 @@ public:
                 }
                 if (key == "sid" && it->is_string()) {
                     sid_value = it->get<std::string>();
+                }
+                if ((key == "shard_key" || key == "tenant_id") && it->is_string()) {
+                    metadata["shard_key"] = it->get<std::string>();
                 }
             }
         }
@@ -1024,6 +1086,12 @@ public:
             if (hit_id != headers.end() && !hit_id->second.empty()) {
                 sid_value = hit_id->second;
             }
+            auto hit_shard = headers.find("x-creek-shard");
+            if (hit_shard == headers.end()) hit_shard = headers.find("shard_key");
+            if (hit_shard == headers.end()) hit_shard = headers.find("tenant_id");
+            if (hit_shard != headers.end() && !hit_shard->second.empty()) {
+                metadata["shard_key"] = hit_shard->second;
+            }
         }
 
         creek::v1::HelloRequest hello_req;
@@ -1031,7 +1099,6 @@ public:
         hello_req.set_sid(sid_value);
         hello_req.set_sticky(sticky);
 
-        Metadata metadata;
         metadata["sid"] = sid_value;
         metadata["sticky"] = sticky ? "true" : "false";
         metadata["x-sid"] = sid_value;
@@ -1115,6 +1182,9 @@ public:
             std::string key(it->first.data(), it->first.size());
             std::string val(it->second.data(), it->second.size());
             metadata[key] = val;
+            if (key == "x-creek-shard" || key == "shard_key" || key == "tenant_id") {
+                metadata["shard_key"] = val;
+            }
         }
         metadata["sid"] = request->sid();
         metadata["sticky"] = request->sticky() ? "true" : "false";
@@ -1138,7 +1208,10 @@ public:
 
         creek::v1::Endpoint ep = request->endpoint();
         ep.set_owner_leaf(config_.id);
-        if (ep.owner_node().empty()) ep.set_owner_node(config_.parent.id);
+        {
+            std::lock_guard<std::mutex> lk(mutex_);
+            ep.set_owner_node(active_parent_.empty() ? (config_.parents.empty() ? std::string{} : config_.parents[0].id) : active_parent_);
+        }
         if (ep.version() == 0) ep.set_version(++version_counter_);
         ep.set_alive(true);
         ep.set_updated_ms(unix_millis());
@@ -1218,8 +1291,14 @@ public:
         while (running_.load()) {
             try {
                 std::unordered_map<std::string, std::string> nodes = redis_->fetch_nodes();
-                std::unordered_map<std::string, std::string> leaves = redis_->fetch_leaves_for_node(config_.parent.id);
-                std::unordered_map<std::string, std::string> all_leaves = leaves;
+                std::unordered_map<std::string, std::string> all_leaves;
+                for (const auto& parent : config_.parents) {
+                    if (parent.id.empty()) continue;
+                    auto leaves = redis_->fetch_leaves_for_node(parent.id);
+                    for (const auto& entry : leaves) {
+                        all_leaves[entry.first] = entry.second;
+                    }
+                }
                 for (const auto& [node_id, _] : nodes) {
                     auto per_node = redis_->fetch_leaves_for_node(node_id);
                     for (const auto& entry : per_node) {
@@ -1264,8 +1343,10 @@ public:
         creek::v1::WireMessage wm;
         *wm.mutable_directory() = snap;
         Bytes payload = serialize_wire(wm);
-        if (!config_.parent.id.empty() && transport_) {
-            transport_->send(config_.parent.id, payload);
+        if (transport_) {
+            for (const auto& pid : parent_ids_) {
+                transport_->send(pid, payload);
+            }
         }
         record_metric("leaf_to_node", "DirectorySnapshot", payload.size(), 0, true);
     }
@@ -1316,7 +1397,25 @@ public:
                 std::this_thread::sleep_for(slice);
                 remaining -= slice;
             }
-            if (running_.load()) send_snapshot_to_parent();
+            if (running_.load()) {
+                {
+                    std::lock_guard<std::mutex> lk(mutex_);
+                    if (active_parent_.empty()) {
+                        auto peers = transport_->peers();
+                        for (const auto& parent_id : parent_ids_) {
+                            for (const auto& p : peers) {
+                                if (p.id == parent_id && p.state == LinkState::Online) {
+                                    active_parent_ = parent_id;
+                                    all_parents_down_.store(false);
+                                    break;
+                                }
+                            }
+                            if (!active_parent_.empty()) break;
+                        }
+                    }
+                }
+                send_snapshot_to_parent();
+            }
         }
     }
 
@@ -1366,6 +1465,9 @@ public:
     std::unordered_map<std::string, std::shared_ptr<PendingResponse>> pending_;
     std::unordered_map<std::string, std::string> peer_targets_;
     std::unordered_map<std::string, creek::Address> known_leaves_;
+    std::set<std::string> parent_ids_;
+    std::string active_parent_;
+    std::atomic<bool> all_parents_down_{true};
     std::uint64_t version_counter_{};
 };
 

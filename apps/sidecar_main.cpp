@@ -26,7 +26,7 @@ struct Options {
     std::string id;
     std::string udp;
     std::vector<std::string> peers;
-    std::string parent;
+    std::vector<std::string> parents;
     std::string grpc;
     std::string json;
     std::string metrics;
@@ -47,7 +47,7 @@ struct Options {
 void usage() {
     std::cerr
         << "usage: creek_sidecar node --id ID --udp HOST:PORT [--peer ID@HOST:PORT]... [--metrics HOST:PORT] [--token TOKEN] [--heartbeat-ms MS] [--dead-timeout-ms MS] [--sync-ms MS] [--metric-period-ms MS] [--redis-host HOST --redis-port PORT [--redis-user USER] [--redis-password PASS] [--redis-key KEY]]\n"
-        << "       creek_sidecar leaf --id ID --udp HOST:PORT --grpc HOST:PORT [--json HOST:PORT] [--metrics HOST:PORT] [--token TOKEN] [--heartbeat-ms MS] [--dead-timeout-ms MS] [--sync-ms MS] [--metric-period-ms MS] [--backend-timeout-ms MS] [--rpc-timeout-ms MS] [--redis-host HOST --redis-port PORT [--redis-user USER] [--redis-password PASS] [--redis-key KEY]]\n";
+         << "       creek_sidecar leaf --id ID --udp HOST:PORT --grpc HOST:PORT --parent ID@HOST:PORT... [--json HOST:PORT] [--metrics HOST:PORT] [--token TOKEN] [--heartbeat-ms MS] [--dead-timeout-ms MS] [--sync-ms MS] [--metric-period-ms MS] [--backend-timeout-ms MS] [--rpc-timeout-ms MS] [--redis-host HOST --redis-port PORT [--redis-user USER] [--redis-password PASS] [--redis-key KEY]]\n";
 }
 
 std::string value_after(int& index, int argc, char** argv, std::string_view option) {
@@ -100,7 +100,7 @@ Options parse_options(int argc, char** argv) {
         } else if (option == "--peer") {
             options.peers.push_back(value_after(index, argc, argv, option));
         } else if (option == "--parent") {
-            options.parent = value_after(index, argc, argv, option);
+            options.parents.push_back(value_after(index, argc, argv, option));
         } else if (option == "--grpc") {
             options.grpc = value_after(index, argc, argv, option);
         } else if (option == "--json") {
@@ -141,10 +141,10 @@ Options parse_options(int argc, char** argv) {
     if (options.id.empty() || options.udp.empty()) {
         throw std::runtime_error("--id and --udp are required");
     }
-    if (options.mode == "node" && (!options.parent.empty() || !options.grpc.empty())) {
+    if (options.mode == "node" && (!options.parents.empty() || !options.grpc.empty())) {
         throw std::runtime_error("--parent and --grpc are only valid for leaf mode");
     }
-    if (options.mode == "leaf" && (options.parent.empty() || options.grpc.empty())) {
+    if (options.mode == "leaf" && (options.parents.empty() || options.grpc.empty())) {
         throw std::runtime_error("leaf mode requires --parent and --grpc");
     }
     if (options.mode == "leaf" && !options.peers.empty()) {
@@ -219,7 +219,9 @@ int execute(const Options& options) {
                            : address_value(options.json, "--json");
     config.metrics_bind = metrics;
     config.token = options.token;
-    config.parent = remote_value(options.parent, "--parent");
+    for (const auto& parent : options.parents) {
+        config.parents.push_back(remote_value(parent, "--parent"));
+    }
     config.sync_interval = options.sync;
     config.metric_period = options.metric_period;
     config.backend_timeout = options.backend_timeout;

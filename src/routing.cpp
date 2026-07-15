@@ -3,6 +3,7 @@
 
 #include <algorithm>
 #include <cstddef>
+#include <functional>
 #include <mutex>
 #include <optional>
 #include <string>
@@ -120,6 +121,14 @@ std::optional<std::string> metadata_sid(const Metadata& metadata) {
     return it->second;
 }
 
+std::optional<std::string> metadata_shard_key(const Metadata& metadata) {
+    auto it = metadata.find("shard_key");
+    if (it != metadata.end() && !it->second.empty()) return it->second;
+    it = metadata.find("tenant_id");
+    if (it != metadata.end() && !it->second.empty()) return it->second;
+    return std::nullopt;
+}
+
 std::optional<creek::v1::Endpoint> find_live_endpoint(
     const std::vector<creek::v1::Endpoint>& endpoints, const std::string& id) {
     for (const auto& ep : endpoints) {
@@ -171,6 +180,13 @@ std::optional<creek::v1::Endpoint> StickyBalancer::pick(
 
     bool sticky = metadata_sticky(metadata);
     auto sid = metadata_sid(metadata);
+    auto shard = metadata_shard_key(metadata);
+
+    if (shard.has_value()) {
+        std::size_t hash = std::hash<std::string>{}(*shard);
+        std::size_t idx = hash % endpoints.size();
+        return endpoints[idx];
+    }
 
     if (!sticky || !sid.has_value()) {
         return do_pick();
@@ -237,6 +253,10 @@ std::size_t StickyBalancer::lru_size() const {
         if (kv.second.lru) ++count;
     }
     return count;
+}
+
+void StickyBalancer::set_shard_key(const std::string& key) {
+    (void)key;
 }
 
 }

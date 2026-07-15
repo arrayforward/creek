@@ -32,7 +32,7 @@ struct LeafConfig {
     Address json_bind;
     Address metrics_bind;
     std::string token;
-    RemotePeer parent;
+    std::vector<RemotePeer> parents;
     std::chrono::milliseconds sync_interval{15000};
     std::chrono::milliseconds backend_timeout{3000};
     std::chrono::milliseconds rpc_timeout{15000};

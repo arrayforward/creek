@@ -118,6 +118,7 @@ public:
     void stop();
     bool connect(const RemotePeer& remote);
     bool send(const std::string& peer_id, Bytes payload);
+    bool send_priority(const std::string& peer_id, Bytes payload, int priority);
     std::vector<PeerEvent> peers() const;
     std::uint16_t local_port() const;
 

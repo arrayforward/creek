@@ -41,6 +41,7 @@ public:
     void invalidate(std::string_view endpoint_id);
     std::size_t active_size() const;
     std::size_t lru_size() const;
+    void set_shard_key(const std::string& key);
 
 private:
     struct Entry {
