@@ -304,7 +304,7 @@ message RoutedRequest {
 ### 路由逻辑
 
 ```mermaid
-flowchart TD
+graph TD
     REQ[RoutedRequest 到达 Node]
     CHK1{destination_node<br/>是当前 Node?}
     CHK2{destination_leaf<br/>存在?}
@@ -349,7 +349,7 @@ flowchart TD
 - 调用 `invalidate()` 主动清除失败的绑定
 
 ```mermaid
-flowchart TD
+graph TD
     PICK[pick(service, metadata)]
     SHARD{有 shard_key?}
     HASH[shard_key 哈希<br/>选固定 endpoint]
