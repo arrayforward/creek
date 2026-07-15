@@ -206,4 +206,4 @@ MIT License © 2025 Creek Authors. 详见 [LICENSE](LICENSE)。
 
 ## 致谢
 
-本项目由 Creek 开发者社区构建。感谢 [nlohmann/json](https://github.com/nlohmann/json)、[gRPC](https://grpc.io/)、[hiredis](https://github.com/redis/hiredis) 和 [Google Test](https://github.com/google/googletest) 开源项目提供的坚实基础。
+本项目由 ArrayForward构建。感谢 [nlohmann/json](https://github.com/nlohmann/json)、[gRPC](https://grpc.io/)、[hiredis](https://github.com/redis/hiredis) 和 [Google Test](https://github.com/google/googletest) 开源项目提供的坚实基础。
