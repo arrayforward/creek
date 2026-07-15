@@ -1,0 +1,124 @@
+syntax = "proto3";
+
+package creek.v1;
+
+message HelloRequest {
+  string name = 1;
+  string sid = 2;
+  bool sticky = 3;
+}
+
+message HelloReply {
+  string message = 1;
+  string backend_id = 2;
+}
+
+service Greeter {
+  rpc SayHello(HelloRequest) returns (HelloReply);
+}
+
+message Endpoint {
+  string endpoint_id = 1;
+  string service = 2;
+  string owner_leaf = 3;
+  string owner_node = 4;
+  string target = 5;
+  uint64 version = 6;
+  uint64 updated_ms = 7;
+  bool alive = 8;
+}
+
+message RegisterRequest {
+  Endpoint endpoint = 1;
+}
+
+message RegisterReply {
+  bool accepted = 1;
+  string error = 2;
+}
+
+message HeartbeatRequest {
+  string endpoint_id = 1;
+}
+
+message HeartbeatReply {
+  bool accepted = 1;
+}
+
+message DeregisterRequest {
+  string endpoint_id = 1;
+}
+
+message DeregisterReply {
+  bool accepted = 1;
+}
+
+service LeafControl {
+  rpc Register(RegisterRequest) returns (RegisterReply);
+  rpc Heartbeat(HeartbeatRequest) returns (HeartbeatReply);
+  rpc Deregister(DeregisterRequest) returns (DeregisterReply);
+}
+
+message DirectorySnapshot {
+  string source_id = 1;
+  uint64 version = 2;
+  uint64 generated_ms = 3;
+  repeated Endpoint endpoints = 4;
+}
+
+message RoutedRequest {
+  string request_id = 1;
+  string origin_leaf = 2;
+  string origin_node = 3;
+  string destination_leaf = 4;
+  string destination_node = 5;
+  string endpoint_id = 6;
+  string rpc_name = 7;
+  map<string, string> metadata = 8;
+  bytes body = 9;
+  uint64 deadline_ms = 10;
+  uint32 hop_limit = 11;
+}
+
+message RoutedResponse {
+  string request_id = 1;
+  string origin_leaf = 2;
+  string origin_node = 3;
+  string destination_leaf = 4;
+  string destination_node = 5;
+  bytes body = 6;
+  int32 status = 7;
+  string error = 8;
+  uint32 hop_limit = 9;
+}
+
+message WireMessage {
+  oneof body {
+    DirectorySnapshot directory = 1;
+    RoutedRequest request = 2;
+    RoutedResponse response = 3;
+  }
+}
+
+message MetricRequest {
+  bool previous_minute = 1;
+  bool take = 2;
+}
+
+message MetricPoint {
+  string direction = 1;
+  string rpc_name = 2;
+  string metadata = 3;
+  uint64 calls = 4;
+  uint64 errors = 5;
+  uint64 bytes = 6;
+  uint64 latency_us = 7;
+}
+
+message MetricReply {
+  repeated MetricPoint points = 1;
+}
+
+service Admin {
+  rpc Metrics(MetricRequest) returns (MetricReply);
+}

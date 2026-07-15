@@ -1,0 +1,168 @@
+cmake_minimum_required(VERSION 3.24)
+
+project(creek VERSION 0.1.0 LANGUAGES CXX)
+
+set(CMAKE_CXX_STANDARD 20)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
+set(CMAKE_CXX_EXTENSIONS OFF)
+set(CMAKE_RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
+set(CMAKE_LIBRARY_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
+set(CMAKE_ARCHIVE_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/lib")
+
+find_package(Protobuf CONFIG REQUIRED)
+find_package(gRPC CONFIG REQUIRED)
+find_package(nlohmann_json CONFIG REQUIRED)
+find_package(GTest CONFIG REQUIRED)
+find_package(Threads REQUIRED)
+find_package(Python3 COMPONENTS Interpreter)
+
+find_path(CREEK_HIREDIS_INCLUDE_DIR
+    NAMES hiredis/hiredis.h
+    PATHS
+        "${CMAKE_PREFIX_PATH}/include"
+        "D:/msys64/mingw64/include"
+        "C:/msys64/mingw64/include"
+        "/usr/include"
+        "/usr/local/include"
+)
+find_library(CREEK_HIREDIS_LIBRARY
+    NAMES hiredis
+    PATHS
+        "${CMAKE_PREFIX_PATH}/lib"
+        "D:/msys64/mingw64/lib"
+        "C:/msys64/mingw64/lib"
+        "/usr/lib"
+        "/usr/local/lib"
+)
+if(NOT CREEK_HIREDIS_INCLUDE_DIR OR NOT CREEK_HIREDIS_LIBRARY)
+    message(FATAL_ERROR "hiredis library not found; install hiredis development headers and library")
+endif()
+
+set(CREEK_PROTO "${CMAKE_CURRENT_SOURCE_DIR}/proto/creek.proto")
+set(CREEK_GENERATED_DIR "${CMAKE_CURRENT_BINARY_DIR}/generated")
+set(CREEK_PROTO_SOURCE "${CREEK_GENERATED_DIR}/creek.pb.cc")
+set(CREEK_PROTO_HEADER "${CREEK_GENERATED_DIR}/creek.pb.h")
+set(CREEK_GRPC_SOURCE "${CREEK_GENERATED_DIR}/creek.grpc.pb.cc")
+set(CREEK_GRPC_HEADER "${CREEK_GENERATED_DIR}/creek.grpc.pb.h")
+
+add_custom_command(
+    OUTPUT
+        "${CREEK_PROTO_SOURCE}"
+        "${CREEK_PROTO_HEADER}"
+        "${CREEK_GRPC_SOURCE}"
+        "${CREEK_GRPC_HEADER}"
+    COMMAND "${CMAKE_COMMAND}" -E make_directory "${CREEK_GENERATED_DIR}"
+    COMMAND "$<TARGET_FILE:protobuf::protoc>"
+        "--proto_path=${CMAKE_CURRENT_SOURCE_DIR}/proto"
+        "--cpp_out=${CREEK_GENERATED_DIR}"
+        "--grpc_out=${CREEK_GENERATED_DIR}"
+        "--plugin=protoc-gen-grpc=$<TARGET_FILE:gRPC::grpc_cpp_plugin>"
+        "${CREEK_PROTO}"
+    DEPENDS
+        "${CREEK_PROTO}"
+        protobuf::protoc
+        gRPC::grpc_cpp_plugin
+    VERBATIM
+)
+
+add_library(creek_proto STATIC
+    "${CREEK_PROTO_SOURCE}"
+    "${CREEK_GRPC_SOURCE}"
+)
+target_include_directories(creek_proto PUBLIC "${CREEK_GENERATED_DIR}")
+target_link_libraries(creek_proto PUBLIC protobuf::libprotobuf gRPC::grpc++)
+
+file(GLOB CREEK_CORE_SOURCES CONFIGURE_DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/src/*.cpp")
+add_library(creek_core STATIC ${CREEK_CORE_SOURCES})
+target_include_directories(creek_core PUBLIC "${CMAKE_CURRENT_SOURCE_DIR}/include")
+target_link_libraries(creek_core
+    PUBLIC
+        creek_proto
+        nlohmann_json::nlohmann_json
+        Threads::Threads
+)
+target_include_directories(creek_core PUBLIC "${CREEK_HIREDIS_INCLUDE_DIR}")
+target_link_libraries(creek_core PUBLIC "${CREEK_HIREDIS_LIBRARY}")
+if(WIN32)
+    target_link_libraries(creek_core PRIVATE ws2_32)
+endif()
+
+add_executable(creek_sidecar "${CMAKE_CURRENT_SOURCE_DIR}/apps/sidecar_main.cpp")
+target_link_libraries(creek_sidecar PRIVATE creek_core)
+
+add_executable(creek_hello_server "${CMAKE_CURRENT_SOURCE_DIR}/apps/hello_server.cpp")
+target_link_libraries(creek_hello_server PRIVATE creek_core)
+
+add_executable(creek_hello_client "${CMAKE_CURRENT_SOURCE_DIR}/apps/hello_client.cpp")
+target_link_libraries(creek_hello_client PRIVATE creek_proto)
+
+enable_testing()
+file(GLOB CREEK_UNIT_TEST_SOURCES CONFIGURE_DEPENDS
+    "${CMAKE_CURRENT_SOURCE_DIR}/tests/*.cpp"
+    "${CMAKE_CURRENT_SOURCE_DIR}/tests/unit/*.cpp"
+)
+list(FILTER CREEK_UNIT_TEST_SOURCES EXCLUDE REGEX ".*/e2e_.*\\.cpp$")
+list(LENGTH CREEK_UNIT_TEST_SOURCES CREEK_UNIT_TEST_COUNT)
+if(NOT CREEK_UNIT_TEST_COUNT EQUAL 3)
+    message(FATAL_ERROR "Expected exactly three unit test source files, found ${CREEK_UNIT_TEST_COUNT}")
+endif()
+foreach(CREEK_UNIT_TEST_SOURCE IN LISTS CREEK_UNIT_TEST_SOURCES)
+    get_filename_component(CREEK_UNIT_TEST_NAME "${CREEK_UNIT_TEST_SOURCE}" NAME_WE)
+    string(REGEX REPLACE "[^A-Za-z0-9_]+" "_" CREEK_UNIT_TEST_NAME "${CREEK_UNIT_TEST_NAME}")
+    set(CREEK_UNIT_TEST_TARGET "creek_${CREEK_UNIT_TEST_NAME}")
+    add_executable("${CREEK_UNIT_TEST_TARGET}" "${CREEK_UNIT_TEST_SOURCE}")
+    target_link_libraries("${CREEK_UNIT_TEST_TARGET}" PRIVATE creek_core GTest::gtest)
+    add_test(NAME "${CREEK_UNIT_TEST_TARGET}" COMMAND "${CREEK_UNIT_TEST_TARGET}")
+endforeach()
+
+add_executable(creek_e2e_2node
+    "${CMAKE_CURRENT_SOURCE_DIR}/tests/e2e_2node_test.cpp"
+    "${CMAKE_CURRENT_SOURCE_DIR}/tests/e2e_2node_main.cpp"
+)
+target_link_libraries(creek_e2e_2node PRIVATE creek_core GTest::gtest_main)
+if(WIN32)
+  set_target_properties(creek_e2e_2node PROPERTIES WIN32_EXECUTABLE OFF)
+endif()
+add_test(
+    NAME creek_e2e_2node
+    COMMAND "$<TARGET_FILE:creek_e2e_2node>"
+)
+set_tests_properties(creek_e2e_2node PROPERTIES
+    TIMEOUT 180
+    RUN_SERIAL TRUE
+    ENVIRONMENT "PATH=${CMAKE_BINARY_DIR}/bin;$ENV{PATH}"
+    ENVIRONMENT "CREEK_SIDECAR=$<TARGET_FILE:creek_sidecar>"
+    ENVIRONMENT "CREEK_HELLO_SERVER=$<TARGET_FILE:creek_hello_server>"
+    ENVIRONMENT "CREEK_HELLO_CLIENT=$<TARGET_FILE:creek_hello_client>"
+    ENVIRONMENT "CREEK_REDIS_HOST=127.0.0.1"
+    ENVIRONMENT "CREEK_REDIS_PORT=6379"
+    ENVIRONMENT "CREEK_REDIS_PASS=creekredis"
+    ENVIRONMENT "CREEK_REDIS_KEY=creek.nodes"
+    ENVIRONMENT "CREEK_E2E_LOG_DIR=D:/vit/creek/tests/e2e-logs"
+    ENVIRONMENT "CREEK_E2E_TOKEN=test-e2e-token"
+)
+
+add_subdirectory(tests)
+
+if(Python3_Interpreter_FOUND)
+    add_test(
+        NAME creek_e2e_grpc
+        COMMAND
+            "${Python3_EXECUTABLE}"
+            "${CMAKE_CURRENT_SOURCE_DIR}/tests/e2e/e2e_grpc.py"
+            --sidecar "$<TARGET_FILE:creek_sidecar>"
+            --hello-server "$<TARGET_FILE:creek_hello_server>"
+            --hello-client "$<TARGET_FILE:creek_hello_client>"
+    )
+    set_tests_properties(creek_e2e_grpc PROPERTIES TIMEOUT 90 RUN_SERIAL TRUE)
+
+    add_test(
+        NAME creek_e2e_jsonrpc
+        COMMAND
+            "${Python3_EXECUTABLE}"
+            "${CMAKE_CURRENT_SOURCE_DIR}/tests/e2e/e2e_jsonrpc.py"
+            --sidecar "$<TARGET_FILE:creek_sidecar>"
+            --hello-server "$<TARGET_FILE:creek_hello_server>"
+    )
+    set_tests_properties(creek_e2e_jsonrpc PROPERTIES TIMEOUT 90 RUN_SERIAL TRUE)
+endif()

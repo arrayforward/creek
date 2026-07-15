@@ -1,0 +1,66 @@
+{
+  "version": 5,
+  "cmakeMinimumRequired": {
+    "major": 3,
+    "minor": 24,
+    "patch": 0
+  },
+  "configurePresets": [
+    {
+      "name": "msys2-ucrt64",
+      "displayName": "MSYS2 UCRT64 Debug",
+      "generator": "Ninja",
+      "binaryDir": "${sourceDir}/build/${presetName}",
+      "environment": {
+        "PATH": "D:\\msys64\\ucrt64\\bin;$penv{PATH}"
+      },
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Debug",
+        "CMAKE_PREFIX_PATH": "D:/msys64/ucrt64",
+        "CMAKE_CXX_COMPILER": "D:/msys64/ucrt64/bin/g++.exe",
+        "CMAKE_MAKE_PROGRAM": "D:/msys64/ucrt64/bin/ninja.exe"
+      }
+    },
+    {
+      "name": "msys2-mingw64",
+      "displayName": "MSYS2 MinGW64 Debug",
+      "generator": "Ninja",
+      "binaryDir": "${sourceDir}/build/${presetName}",
+      "environment": {
+        "PATH": "D:\\msys64\\mingw64\\bin;$penv{PATH}"
+      },
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Debug",
+        "CMAKE_PREFIX_PATH": "D:/msys64/mingw64",
+        "CMAKE_CXX_COMPILER": "D:/msys64/mingw64/bin/g++.exe",
+        "CMAKE_MAKE_PROGRAM": "D:/msys64/mingw64/bin/ninja.exe"
+      }
+    }
+  ],
+  "buildPresets": [
+    {
+      "name": "msys2-ucrt64",
+      "configurePreset": "msys2-ucrt64"
+    },
+    {
+      "name": "msys2-mingw64",
+      "configurePreset": "msys2-mingw64"
+    }
+  ],
+  "testPresets": [
+    {
+      "name": "msys2-ucrt64",
+      "configurePreset": "msys2-ucrt64",
+      "output": {
+        "outputOnFailure": true
+      }
+    },
+    {
+      "name": "msys2-mingw64",
+      "configurePreset": "msys2-mingw64",
+      "output": {
+        "outputOnFailure": true
+      }
+    }
+  ]
+}
