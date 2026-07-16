@@ -349,6 +349,7 @@ public:
     struct IncomingMessage {
         std::uint32_t message_id{};
         std::uint16_t total_count{};
+        std::uint16_t data_count{};
         std::vector<std::optional<Bytes>> fragments;
         std::vector<std::uint16_t> sizes;
         std::chrono::steady_clock::time_point first_seen;
@@ -773,6 +774,7 @@ public:
         if (in.message_id == 0) {
             in.message_id = header.message_id;
             in.total_count = cnt;
+            in.data_count = header.flags;
             in.fragments.assign(cnt, std::nullopt);
             in.sizes.assign(cnt, 0);
             in.first_seen = std::chrono::steady_clock::now();
@@ -791,7 +793,8 @@ public:
 
     bool try_assemble(Peer* peer, IncomingMessage& in) {
         if (in.total_count < 2) return false;
-        std::size_t data_count = in.total_count - 1;
+        std::size_t data_count = in.data_count > 0 ? in.data_count : (in.total_count - 1);
+        std::size_t parity_count = in.total_count - data_count;
         std::size_t have = 0;
         for (std::size_t i = 0; i < data_count; ++i) {
             if (in.fragments[i].has_value()) ++have;
@@ -821,31 +824,53 @@ public:
             deliver_message(peer, build_msg(parts, real_sizes));
             return true;
         }
-        if (!in.fragments[in.total_count - 1].has_value()) return false;
         std::size_t missing = SIZE_MAX;
         std::size_t multi = 0;
         for (std::size_t i = 0; i < data_count; ++i) {
-            if (!in.fragments[i].has_value()) {
-                ++multi;
-                missing = i;
-            }
+            if (!in.fragments[i].has_value()) { ++multi; missing = i; }
         }
-        if (multi != 1) return false;
+        if (multi > parity_count) return false;
+        if (multi == 0) return false;
         std::size_t width = 0;
         for (auto& f : in.fragments) {
-            if (f.has_value()) {
-                width = std::max(width, f->size());
+            if (f.has_value()) width = std::max(width, f->size());
+        }
+        if (width == 0) return false;
+        std::vector<Bytes> frags(data_count);
+        for (std::size_t i = 0; i < data_count; ++i) {
+            frags[i] = in.fragments[i].has_value() ? *in.fragments[i] : Bytes(width, 0);
+        }
+        std::vector<std::size_t> missing_indices;
+        for (std::size_t i = 0; i < data_count; ++i) {
+            if (!in.fragments[i].has_value()) missing_indices.push_back(i);
+        }
+        for (std::size_t p = 0; p < parity_count && !missing_indices.empty(); ++p) {
+            if (!in.fragments[data_count + p].has_value()) continue;
+            Bytes parity_data = *in.fragments[data_count + p];
+            std::vector<Bytes> rotated(data_count);
+            for (std::size_t i = 0; i < data_count; ++i) {
+                rotated[i] = frags[(i + p) % data_count];
+            }
+            std::vector<std::size_t> rotated_missing;
+            for (auto idx : missing_indices) {
+                rotated_missing.push_back((idx + data_count - p) % data_count);
+            }
+            if (rotated_missing.size() == 1) {
+                if (ReedSolomon::recover_one(rotated, parity_data, rotated_missing[0], width)) {
+                    frags[(rotated_missing[0] + p) % data_count] = rotated[rotated_missing[0]];
+                    *in.fragments[(rotated_missing[0] + p) % data_count] = rotated[rotated_missing[0]];
+                    in.sizes[(rotated_missing[0] + p) % data_count] = in.sizes[data_count + p];
+                    missing_indices.clear();
+                    break;
+                }
             }
         }
-        std::vector<Bytes> frags;
-        frags.reserve(data_count);
+        if (!missing_indices.empty()) return false;
+        std::vector<Bytes> recovered_parts(data_count);
         for (std::size_t i = 0; i < data_count; ++i) {
-            if (in.fragments[i].has_value()) frags.push_back(*in.fragments[i]);
-            else frags.push_back(Bytes(width, 0));
+            recovered_parts[i] = frags[i];
         }
-        Bytes parity = *in.fragments[in.total_count - 1];
-        if (!ReedSolomon::recover_one(frags, parity, missing, width)) return false;
-        deliver_message(peer, build_msg(frags, in.sizes));
+        deliver_message(peer, build_msg(recovered_parts, in.sizes));
         return true;
     }
 
@@ -911,12 +936,14 @@ public:
     }
 
     void send_data_packet(Peer* peer, std::uint32_t msg_id, std::uint16_t idx,
-                          std::uint16_t cnt, std::uint16_t real_size,
+                          std::uint16_t cnt, std::uint16_t data_cnt,
+                          std::uint16_t real_size,
                           const Bytes& payload, bool ackable) {
         PacketHeader header{};
         header.magic = kMagic;
         header.version = kVersion;
         header.type = (idx + 1 == cnt) ? PacketType::Parity : PacketType::Data;
+        header.flags = data_cnt;
         header.client_id = local_client_id;
         header.session_id = local_session_id;
         if (ackable) {
@@ -1081,6 +1108,14 @@ public:
         }
     }
 
+    uint16_t compute_parity_count(Peer* peer) {
+        auto rtt_ms = std::chrono::duration_cast<std::chrono::milliseconds>(bandwidth.rtt()).count();
+        if (rtt_ms <= 0) return 1;
+        if (rtt_ms < 5) return 1;
+        if (rtt_ms < 20) return 2;
+        return 2;
+    }
+
     void fragment_and_send(Peer* peer, Bytes payload) {
         std::size_t frag_payload = config.mtu > kHeaderSize ? config.mtu - kHeaderSize : 64;
         if (frag_payload <= 4) frag_payload = 64;
@@ -1110,12 +1145,25 @@ public:
             if (frags[i].size() < width) frags[i].resize(width, 0);
         }
         Bytes parity = ReedSolomon::parity(frags, width);
-        std::uint16_t cnt = static_cast<std::uint16_t>(data_count + 1);
-        for (std::size_t i = 0; i < data_count; ++i) {
-            send_data_packet(peer, msg_id, static_cast<std::uint16_t>(i), cnt, frag_lens[i], frags[i], true);
+        std::uint16_t parity_count = compute_parity_count(peer);
+        std::vector<Bytes> parities;
+        parities.push_back(parity);
+        for (std::uint16_t p = 1; p < parity_count; ++p) {
+            std::vector<Bytes> rotated(frags.size());
+            for (std::size_t i = 0; i < frags.size(); ++i) {
+                rotated[i] = frags[(i + p) % frags.size()];
+            }
+            parities.push_back(ReedSolomon::parity(rotated, width));
         }
-        send_data_packet(peer, msg_id, static_cast<std::uint16_t>(data_count), cnt, static_cast<std::uint16_t>(width),
-                         parity, true);
+        std::uint16_t cnt = static_cast<std::uint16_t>(data_count + parity_count);
+        std::uint16_t d_cnt = static_cast<std::uint16_t>(data_count);
+        for (std::size_t i = 0; i < data_count; ++i) {
+            send_data_packet(peer, msg_id, static_cast<std::uint16_t>(i), cnt, d_cnt, frag_lens[i], frags[i], true);
+        }
+        for (std::uint16_t p = 0; p < parity_count; ++p) {
+            send_data_packet(peer, msg_id, static_cast<std::uint16_t>(data_count + p), cnt, d_cnt, static_cast<std::uint16_t>(width),
+                             parities[p], true);
+        }
     }
 
     void send_byes() {
