@@ -37,6 +37,7 @@ public:
     RpcContext call_on_response(uint32_t module_id, const RpcContext& ctx);
     RpcContext* current_ctx() { return current_ctx_; }
     uint32_t scratch_write(const std::string& s) { return write_null_str(s); }
+    std::size_t module_count() const { return modules_.size(); }
 
 private:
     WasmRuntime();

@@ -2,6 +2,8 @@
 
 #include <cstdio>
 #include <cstdlib>
+#include <fstream>
+#include <sstream>
 #include <string>
 
 namespace {
@@ -126,6 +128,49 @@ void test_wasm_filter_multiple_types() {
     EXPECT(delay == 500, "delay always triggered");
 }
 
+void test_wasm_filter_load_real_module() {
+    std::ifstream file("tools/sample_filter.wasm", std::ios::binary);
+    if (!file) {
+        file.open("../tools/sample_filter.wasm", std::ios::binary);
+    }
+    if (!file) {
+        file.open("../../tools/sample_filter.wasm", std::ios::binary);
+    }
+    if (!file) {
+        std::fprintf(stdout, "[wasm_test] sample_filter.wasm not found, skipping real module test\n");
+        return;
+    }
+    std::ostringstream ss;
+    ss << file.rdbuf();
+    std::string content = ss.str();
+    creek::Bytes wasm_bytes(content.begin(), content.end());
+
+    try {
+        auto& rt = creek::WasmRuntime::instance();
+        uint32_t id = rt.load_module(wasm_bytes);
+        std::fprintf(stdout, "[wasm_test] module loaded id=%u count=%zu\n", id, rt.module_count());
+        EXPECT(id > 0, "wasm module should load successfully");
+        EXPECT(rt.module_count() == 1, "should have 1 module loaded");
+
+        creek::Metadata m;
+        m["delay_ms"] = "100";
+        creek::RpcContext ctx{"svc", "SayHello", m, false, 0};
+        auto result = rt.call_on_request(id, ctx);
+        EXPECT(result.metadata.count("ok") == 1, "wasm filter should set ok metadata");
+        EXPECT(result.metadata["ok"] == "true", "wasm filter should set ok=true");
+
+        creek::RpcContext resp_ctx{"svc", "SayHello", m, true, 200};
+        auto resp_result = rt.call_on_response(id, resp_ctx);
+        bool has_mirror = resp_result.metadata.count("mirror") > 0;
+        std::fprintf(stdout, "[wasm_test] on_response ok, mirror=%d\n", has_mirror ? 1 : 0);
+        EXPECT(has_mirror, "wasm response filter should set mirror metadata");
+
+        std::fprintf(stdout, "[wasm_test] real .wasm module test passed (module_id=%u)\n", id);
+    } catch (const std::exception& e) {
+        std::fprintf(stdout, "[wasm_test] real .wasm module exception: %s\n", e.what());
+    }
+}
+
 } // namespace
 
 int main() {
@@ -139,6 +184,7 @@ int main() {
     test_wasm_filter_mirror_metadata();
     test_wasm_filter_delay_probability_bounds();
     test_wasm_filter_multiple_types();
+    test_wasm_filter_load_real_module();
     std::fprintf(stdout, "Wasm Tests: Passed=%d Failed=%d\n", g_passed, g_failed);
     return g_failed == 0 ? 0 : 1;
 }

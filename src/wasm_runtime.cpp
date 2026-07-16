@@ -115,28 +115,31 @@ uint32_t WasmRuntime::load_module(const Bytes& wasm_bytes) {
         throw std::runtime_error(std::string("WasmRuntime: parse failed: ") + result);
     }
 
-    result = m3_LoadModule(runtime_, mi.module);
+    modules_.push_back(std::move(mi));
+    ModuleInfo& mod_ref = modules_.back();
+
+    result = m3_LoadModule(runtime_, mod_ref.module);
     if (result) {
-        m3_FreeModule(mi.module);
+        m3_FreeModule(mod_ref.module);
+        modules_.pop_back();
         throw std::runtime_error(std::string("WasmRuntime: load failed: ") + result);
     }
 
-    register_host_imports(mi);
+    register_host_imports(mod_ref);
 
-    result = m3_CompileModule(mi.module);
+    result = m3_CompileModule(mod_ref.module);
     if (result) {
         throw std::runtime_error(std::string("WasmRuntime: compile failed: ") + result);
     }
 
-    result = m3_RunStart(mi.module);
+    result = m3_RunStart(mod_ref.module);
     if (result && result != m3Err_functionLookupFailed) {
         throw std::runtime_error(std::string("WasmRuntime: start failed: ") + result);
     }
 
     ensure_memory(2);
 
-    modules_.push_back(std::move(mi));
-    return modules_.back().id;
+    return mod_ref.id;
 }
 
 void WasmRuntime::link_host_function(uint32_t module_id,
