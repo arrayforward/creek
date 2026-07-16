@@ -107,7 +107,7 @@ sequenceDiagram
         end
     end
 
-    Note over N: 对 Redis 中新发现的 Node<br/>发起 Tight::connect()
+    Note over N: 对 Redis 中新发现的 Node 发起 Tight connect()
 ```
 
 1. Node 启动时，若配置了 Redis，立即执行 `HSET {key} {id} {udp_addr}` 注册自身
@@ -124,7 +124,7 @@ sequenceDiagram
 
     L->>R: HGETALL creek.nodes
     R-->>L: 所有 Node 列表
-    Note over L: 若 --parent 指定<br/>验证父 Node 存在<br/>否则随机选择
+    Note over L: 若 --parent 指定则验证父 Node 存在，否则随机选择
     L->>R: HSET creek.nodes:leaves {parent}:{leaf_id} {udp_addr}
     L->>N: Tight::connect()
 

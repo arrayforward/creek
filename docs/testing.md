@@ -133,20 +133,20 @@ ctest --test-dir build -R creek_wasm_test -V
 ```mermaid
 graph TB
     subgraph "Node Layer"
-        N1[(Node-1<br/>UDP:30000<br/>Metrics:30001)]
-        N2[(Node-2<br/>UDP:30004<br/>Metrics:30005)]
-        N1 <-->|Tight UDP<br/>mutual --peer| N2
+        N1[(Node-1 UDP:30000 Metrics:30001)]
+        N2[(Node-2 UDP:30004 Metrics:30005)]
+        N1 <-->|Tight UDP mutual peer| N2
     end
 
     subgraph "Leaf Layer"
-        CL[Client Leaf<br/>UDP:30008<br/>gRPC:30009<br/>Metrics:30012]
-        S1L[Service1 Leaf<br/>UDP:30013<br/>gRPC:30016<br/>Metrics:30017]
-        S2L[Service2 Leaf<br/>UDP:30020<br/>gRPC:30021<br/>Metrics:30024]
+        CL[Client Leaf UDP:30008 gRPC:30009 Metrics:30012]
+        S1L[Service1 Leaf UDP:30013 gRPC:30016 Metrics:30017]
+        S2L[Service2 Leaf UDP:30020 gRPC:30021 Metrics:30024]
     end
 
     subgraph "Backend"
-        B1[(Backend-1<br/>TCP:30025)]
-        B2[(Backend-2<br/>TCP:30028)]
+        B1[(Backend-1 TCP:30025)]
+        B2[(Backend-2 TCP:30028)]
     end
 
     CL -->|parent| N1
@@ -156,7 +156,7 @@ graph TB
     B2 -->|register| S2L
     Client -->|gRPC SayHello| CL
 
-    R[(Redis<br/>127.0.0.1:6379)] -.->|Service Discovery| N1
+    R[(Redis 127.0.0.1:6379)] -.->|Service Discovery| N1
     R -.->|Service Discovery| N2
 ```
 
