@@ -346,4 +346,111 @@ std::string WasmFilter::name() const {
     return "WasmFilter[" + wasm_path_ + "]";
 }
 
+class JsonRuleFilter::Impl {
+public:
+    WasmConfig config;
+    mutable std::mt19937 rng{std::random_device{}()};
+
+    JsonRuleFilter::Result do_request(const std::string& service, const std::string& method, Metadata& metadata) {
+        JsonRuleFilter::Result r;
+        if (config.type == "delay") {
+            std::uniform_real_distribution<double> dist(0.0, 1.0);
+            if (dist(rng) < config.probability) {
+                r.action = JsonRuleFilter::Action::Delay;
+                r.delay_ms = config.delay_ms;
+            }
+        } else if (config.type == "mirror") {
+            r.action = JsonRuleFilter::Action::Mirror;
+            r.mirror_target = config.mirror_target;
+            metadata["creek_mirror"] = config.mirror_target;
+        } else if (config.type == "canary") {
+            std::uniform_int_distribution<int> dist(0, 99);
+            if (dist(rng) < config.canary_percentage) {
+                r.action = JsonRuleFilter::Action::Reroute;
+                r.route_override = config.canary_endpoint;
+                metadata["creek_canary"] = config.canary_endpoint;
+            }
+        } else if (config.type == "reject") {
+            std::uniform_real_distribution<double> dist(0.0, 1.0);
+            if (dist(rng) < config.probability) {
+                r.action = JsonRuleFilter::Action::Reject;
+                r.status_code = 503;
+            }
+        }
+        return r;
+    }
+
+    JsonRuleFilter::Result do_response(int status_code, Metadata& metadata) {
+        JsonRuleFilter::Result r;
+        (void)status_code;
+        (void)metadata;
+        return r;
+    }
+};
+
+JsonRuleFilter::JsonRuleFilter(WasmConfig config) : impl_(std::make_unique<Impl>()) {
+    impl_->config = std::move(config);
+}
+
+JsonRuleFilter::JsonRuleFilter(const std::string& json_config) : impl_(std::make_unique<Impl>()) {
+    auto j = nlohmann::json::parse(json_config);
+    impl_->config.type = j.value("type", std::string("passthrough"));
+    impl_->config.probability = j.value("probability", 1.0);
+    impl_->config.delay_ms = j.value("delay_ms", 0);
+    impl_->config.mirror_target = j.value("mirror_target", std::string());
+    impl_->config.canary_endpoint = j.value("canary_endpoint", std::string());
+    impl_->config.canary_percentage = j.value("canary_percentage", 0);
+}
+
+JsonRuleFilter::~JsonRuleFilter() = default;
+JsonRuleFilter::JsonRuleFilter(JsonRuleFilter&&) = default;
+JsonRuleFilter& JsonRuleFilter::operator=(JsonRuleFilter&&) = default;
+
+JsonRuleFilter::Result JsonRuleFilter::on_request(const std::string& service, const std::string& method, Metadata& metadata) {
+    return impl_->do_request(service, method, metadata);
+}
+
+JsonRuleFilter::Result JsonRuleFilter::on_response(int status_code, Metadata& metadata) {
+    return impl_->do_response(status_code, metadata);
+}
+
+std::string JsonRuleFilter::name() const { return impl_->config.type; }
+
+void JsonRuleFilterChain::add_json(const std::string& json_config) {
+    filters_.emplace_back(json_config);
+}
+
+void JsonRuleFilterChain::add(JsonRuleFilter filter) {
+    filters_.push_back(std::move(filter));
+}
+
+JsonRuleFilter::Result JsonRuleFilterChain::process_request(const std::string& service, const std::string& method, Metadata& metadata) {
+    JsonRuleFilter::Result final_result;
+    for (auto& f : filters_) {
+        auto r = f.on_request(service, method, metadata);
+        if (r.action == JsonRuleFilter::Action::Reject) return r;
+        if (r.action == JsonRuleFilter::Action::Delay) final_result.action = r.action;
+        if (r.action == JsonRuleFilter::Action::Delay) final_result.delay_ms = r.delay_ms;
+        if (!r.mirror_target.empty()) final_result.mirror_target = r.mirror_target;
+        if (!r.route_override.empty()) final_result.route_override = r.route_override;
+        if (r.action != JsonRuleFilter::Action::Passthrough && final_result.action == JsonRuleFilter::Action::Passthrough) {
+            final_result.action = r.action;
+        }
+    }
+    return final_result;
+}
+
+JsonRuleFilter::Result JsonRuleFilterChain::process_response(int status_code, Metadata& metadata) {
+    JsonRuleFilter::Result final_result;
+    for (auto it = filters_.rbegin(); it != filters_.rend(); ++it) {
+        auto r = it->on_response(status_code, metadata);
+        if (!r.mirror_target.empty()) final_result.mirror_target = r.mirror_target;
+        if (!r.route_override.empty()) final_result.route_override = r.route_override;
+    }
+    return final_result;
+}
+
+std::size_t JsonRuleFilterChain::size() const { return filters_.size(); }
+void JsonRuleFilterChain::clear() { filters_.clear(); }
+
 }

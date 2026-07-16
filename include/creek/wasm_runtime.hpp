@@ -85,4 +85,52 @@ private:
     std::string wasm_path_;
 };
 
+struct WasmConfig {
+    std::string type;
+    double probability{1.0};
+    int delay_ms{};
+    std::string mirror_target;
+    std::string canary_endpoint;
+    int canary_percentage{};
+};
+
+class JsonRuleFilter {
+public:
+    enum class Action { Passthrough, Delay, Mirror, Reroute, Reject };
+    struct Result {
+        Action action{Action::Passthrough};
+        int delay_ms{};
+        std::string mirror_target;
+        std::string route_override;
+        int status_code{200};
+    };
+
+    explicit JsonRuleFilter(WasmConfig config);
+    explicit JsonRuleFilter(const std::string& json_config);
+    ~JsonRuleFilter();
+    JsonRuleFilter(JsonRuleFilter&&);
+    JsonRuleFilter& operator=(JsonRuleFilter&&);
+
+    Result on_request(const std::string& service, const std::string& method, Metadata& metadata);
+    Result on_response(int status_code, Metadata& metadata);
+    std::string name() const;
+
+private:
+    class Impl;
+    std::unique_ptr<Impl> impl_;
+};
+
+class JsonRuleFilterChain {
+public:
+    void add_json(const std::string& json_config);
+    void add(JsonRuleFilter filter);
+    JsonRuleFilter::Result process_request(const std::string& service, const std::string& method, Metadata& metadata);
+    JsonRuleFilter::Result process_response(int status_code, Metadata& metadata);
+    std::size_t size() const;
+    void clear();
+
+private:
+    std::vector<JsonRuleFilter> filters_;
+};
+
 }
