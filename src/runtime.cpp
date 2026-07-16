@@ -3,6 +3,7 @@
 #include "creek.pb.h"
 #include "creek.grpc.pb.h"
 #include "creek/circuit_breaker.hpp"
+#include "creek/trace_context.hpp"
 #include "creek/wasm_runtime.hpp"
 #include "creek/json_rpc.hpp"
 #include "creek/metrics.hpp"
@@ -805,6 +806,17 @@ public:
         grpc::ClientContext ctx;
         ctx.set_deadline(std::chrono::system_clock::now() + config_.backend_timeout);
         auto stub = get_stub(ep_opt->target());
+        auto it_tp = req.metadata().find("traceparent");
+        std::string tp = (it_tp != req.metadata().end()) ? it_tp->second : std::string();
+        auto it_ts = req.metadata().find("tracestate");
+        std::string ts = (it_ts != req.metadata().end()) ? it_ts->second : std::string();
+        TraceSpan mesh_span = TraceContext::extract_or_create(tp, ts);
+        TraceSpan backend_span = TraceContext::create_child(mesh_span);
+        std::fprintf(stderr, "[trace] leaf_backend: trace_id=%.32s span_id=%.16s parent=%.16s ep=%s\n",
+                     backend_span.trace_id.c_str(), backend_span.span_id.c_str(),
+                     backend_span.parent_span_id.c_str(), ep_opt->endpoint_id().c_str());
+        std::fflush(stderr);
+
         grpc::Status status = stub->SayHello(&ctx, hello_req, &hello_reply);
         auto latency = std::chrono::duration_cast<std::chrono::microseconds>(
             SteadyClock::now() - start).count();
@@ -1120,6 +1132,15 @@ public:
         metadata["sticky"] = sticky ? "true" : "false";
         metadata["x-sid"] = sid_value;
 
+        auto it_tp = headers.find("traceparent");
+        std::string tp = (it_tp != headers.end()) ? it_tp->second : std::string();
+        auto it_ts = headers.find("tracestate");
+        std::string ts = (it_ts != headers.end()) ? it_ts->second : std::string();
+        TraceSpan span = TraceContext::extract_or_create(tp, ts);
+        TraceSpan child = TraceContext::create_child(span);
+        metadata["traceparent"] = child.traceparent_swapped();
+        if (!child.trace_state.empty()) metadata["tracestate"] = child.trace_state;
+
         creek::v1::HelloReply hello_reply;
         grpc::Status status = invoke_for_hello(hello_req, metadata, &hello_reply);
         nlohmann::json response_body;
@@ -1218,6 +1239,18 @@ public:
         metadata["sid"] = request->sid();
         metadata["sticky"] = request->sticky() ? "true" : "false";
         metadata["x-sid"] = request->sid();
+
+        auto it_trace = metadata.find("traceparent");
+        std::string tp = (it_trace != metadata.end()) ? it_trace->second : std::string();
+        auto it_state = metadata.find("tracestate");
+        std::string ts = (it_state != metadata.end()) ? it_state->second : std::string();
+        TraceSpan span = TraceContext::extract_or_create(tp, ts);
+        TraceSpan child = TraceContext::create_child(span);
+        metadata["traceparent"] = child.traceparent_swapped();
+        if (!child.trace_state.empty()) metadata["tracestate"] = child.trace_state;
+        std::fprintf(stderr, "[trace] gRPC entry: trace_id=%.32s span_id=%.16s parent=%.16s\n",
+                     child.trace_id.c_str(), child.span_id.c_str(), child.parent_span_id.c_str());
+        std::fflush(stderr);
 
         grpc::Status status = invoke_for_hello(*request, metadata, response);
         return status;
