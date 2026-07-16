@@ -1,6 +1,6 @@
 cmake_minimum_required(VERSION 3.24)
 
-project(creek VERSION 0.1.0 LANGUAGES CXX)
+project(creek VERSION 0.1.0 LANGUAGES CXX C)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -108,6 +108,13 @@ target_link_libraries(creek_core PUBLIC "${CREEK_HIREDIS_LIBRARY}" "${CREEK_OPEN
 if(WIN32)
     target_link_libraries(creek_core PRIVATE ws2_32)
 endif()
+
+file(GLOB CREEK_WASM3_SOURCES CONFIGURE_DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/third_party/wasm3/source/m3_*.c")
+list(FILTER CREEK_WASM3_SOURCES EXCLUDE REGEX ".*m3_api_uvwasi\\.c$")
+add_library(creek_wasm3 STATIC ${CREEK_WASM3_SOURCES})
+target_include_directories(creek_wasm3 PUBLIC "${CMAKE_CURRENT_SOURCE_DIR}/third_party/wasm3/source")
+target_compile_features(creek_wasm3 PRIVATE c_std_99)
+target_link_libraries(creek_core PUBLIC creek_wasm3)
 
 add_executable(creek_sidecar "${CMAKE_CURRENT_SOURCE_DIR}/apps/sidecar_main.cpp")
 target_link_libraries(creek_sidecar PRIVATE creek_core)
