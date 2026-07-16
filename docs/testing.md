@@ -8,6 +8,7 @@ Creek 的测试分为三个层级：
 |---|---|---|---|
 | 单元测试 | `creek_tight_test` | 自实现宏 | 传输协议：编码/解码/CRC/FEC/BWE/握手 |
 | 单元测试 | `creek_routing_metrics_test` | 自实现宏 | 目录合并、粘性路由、指标旋转 |
+| 单元测试 | `creek_wasm_test` | 自实现宏 | WASM 模块加载、沙箱执行、热替换 |
 | E2E 集成 | `creek_e2e_2node` | GTest | 2 Node 完整拓扑 + Redis |
 | E2E 集成 | `creek_e2e` | Python (pytest) | Python 驱动的全流程 E2E |
 | 集成测试 | `creek_redis_discovery_e2e` | GTest | Redis 服务发现专用测试 |
@@ -26,6 +27,7 @@ Test #2:  creek_routing_metrics_test
 Test #3:  creek_e2e_2node
 Test #4:  creek_redis_discovery_e2e
 Test #5:  creek_e2e
+Test #6:  creek_wasm_test
 ```
 
 ### 测试详情
@@ -98,11 +100,31 @@ ctest --test-dir build -R creek_redis_discovery_e2e -V
 
 **源文件：** `tests/e2e/e2e.py`
 
-Python 驱动的 E2E 测试，使用 `subprocess` 管理进程、`socket` 进行端口检测和 HTTP 交互。
+Python 驱动的 E2E 测试，使用 `subprocess` 管理进程、`socket` 进行端口检测和 HTTP 交互。E2E 覆盖 gRPC 与 JSON-RPC 双模式入口，验证跨协议一致性。
 
 ```bash
 ctest --test-dir build -R creek_e2e -V
 ```
+
+#### 6. creek_wasm_test
+
+**源文件：** `tests/wasm_test.cpp`
+
+验证 WASM 模块的加载、沙箱执行与热替换 (RCU swap) 流程。
+
+| 测试用例 | 说明 |
+|---|---|
+| `test_wasm_load_and_call` | WASM 模块加载并调用导出函数 |
+| `test_wasm_sandbox_isolation` | WASM 沙箱隔离：内存越界、非法指令保护 |
+| `test_wasm_hot_reload` | 热替换：新旧模块并行、旧模块引用计数归零后释放 |
+
+```bash
+ctest --test-dir build -R creek_wasm_test -V
+```
+
+### 管理工具
+
+`creek_admin_client` 是命令行管理工具，通过 gRPC 连接 Leaf 的 Admin 服务，支持远程推送 WASM 模块、管理路由规则和查询路由表。E2E 测试包含 admin_client 的端到端验证：推送 WASM → 规则生效 → 请求命中自定义逻辑。
 
 ## E2E 拓扑说明
 

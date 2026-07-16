@@ -112,11 +112,16 @@ sequenceDiagram
 
 ### 1.3 Admin Service
 
-指标查询服务，由 Leaf 暴露。
+管理与运维服务，由 Leaf 暴露，提供指标查询、粘性策略、熔断器、WASM 模块管理等功能。
 
 ```protobuf
 service Admin {
   rpc Metrics(MetricRequest) returns (MetricReply);
+  rpc SetStickyStrategy(StickyStrategyRequest) returns (StickyStrategyReply);
+  rpc SetBreakerConfig(BreakerConfigRequest) returns (BreakerConfigReply);
+  rpc PushWasmModule(PushWasmRequest) returns (PushWasmReply);
+  rpc ListWasmModules(ListWasmRequest) returns (ListWasmReply);
+  rpc UnloadWasmModule(UnloadWasmRequest) returns (UnloadWasmReply);
 }
 
 message MetricRequest {
@@ -136,6 +141,63 @@ message MetricPoint {
 
 message MetricReply {
   repeated MetricPoint points = 1;
+}
+
+message StickyStrategyRequest {
+  string service = 1;    // 服务名称
+  int32 strategy = 2;    // 粘性策略：0 = 清零 shard，非零值表示启用
+  int64 ttl_ms = 3;      // 粘性 TTL（毫秒）
+}
+
+message StickyStrategyReply {
+  bool accepted = 1;
+  string error = 2;
+}
+
+message BreakerConfigRequest {
+  string endpoint_id = 1;                 // 目标 endpoint ID，空字符串表示全部
+  int64 cooldown_ms = 2;                  // 冷却时间（毫秒）
+  int64 latency_threshold_us = 3;         // 延迟阈值（微秒）
+  double error_rate_threshold = 4;        // 错误率阈值
+  int32 consecutive_failure_threshold = 5; // 连续失败阈值
+}
+
+message BreakerConfigReply {
+  bool accepted = 1;
+  string error = 2;
+}
+
+message PushWasmRequest {
+  string module_name = 1;   // WASM 模块名称
+  bytes wasm_bytes = 2;     // WASM 字节码
+}
+
+message PushWasmReply {
+  bool accepted = 1;
+  uint32 module_id = 2;     // 分配到的模块 ID
+  string error = 3;
+}
+
+message ListWasmRequest {
+}
+
+message ListWasmReply {
+  repeated WasmModuleInfo modules = 1;
+}
+
+message WasmModuleInfo {
+  uint32 module_id = 1;   // 模块 ID
+  string name = 2;        // 模块名称
+  int64 size = 3;         // 字节大小
+}
+
+message UnloadWasmRequest {
+  uint32 module_id = 1;   // 要卸载的模块 ID
+}
+
+message UnloadWasmReply {
+  bool accepted = 1;
+  string error = 2;
 }
 ```
 
@@ -403,3 +465,83 @@ creek_hello_client --target HOST:PORT [OPTIONS]
 | `CREEK_REDIS_KEY` | Redis Hash Key | E2E 测试（默认 creek.nodes） |
 | `CREEK_E2E_LOG_DIR` | E2E 日志输出目录 | E2E 测试 |
 | `CREEK_E2E_TOKEN` | E2E 认证令牌 | E2E 测试 |
+
+## 6. creek_admin_client CLI
+
+`creek_admin_client` 是 Admin Service 的命令行客户端，通过 gRPC 调用 Leaf 的管理接口。
+
+### 用法
+
+```
+creek_admin --target HOST:PORT <command> [args]
+  sticky SERVICE STRATEGY TTL_MS
+  breaker [ENDPOINT_ID]
+  push-wasm NAME WASM_FILE
+  list-wasm
+  unload-wasm MODULE_ID
+  metrics
+```
+
+### 命令参考
+
+| 命令 | 参数 | 对应 RPC | 说明 |
+|---|---|---|---|
+| `sticky` | `SERVICE STRATEGY TTL_MS` | `SetStickyStrategy` | 热更新粘性策略 |
+| `breaker` | `[ENDPOINT_ID]` | `SetBreakerConfig` | 重置熔断器（省略 endpoint 则重置全部） |
+| `push-wasm` | `NAME WASM_FILE` | `PushWasmModule` | 推送 WASM 模块文件 |
+| `list-wasm` | 无 | `ListWasmModules` | 列出已加载的 WASM 模块 |
+| `unload-wasm` | `MODULE_ID` | `UnloadWasmModule` | 卸载指定 WASM 模块 |
+| `metrics` | 无 | `Metrics` | 查询指标快照 |
+
+### 使用示例
+
+**热更新粘性策略：**
+
+```bash
+# 将 greeter 服务的粘性 TTL 设为 5000ms，策略非零（启用）
+creek_admin --target 127.0.0.1:9000 sticky greeter 1 5000
+
+# 将 greeter 服务的粘性策略清零
+creek_admin --target 127.0.0.1:9000 sticky greeter 0 0
+```
+
+**重置熔断器：**
+
+```bash
+# 重置所有 endpoint 的熔断器（使用默认参数）
+creek_admin --target 127.0.0.1:9000 breaker
+
+# 重置指定 endpoint 的熔断器
+creek_admin --target 127.0.0.1:9000 breaker backend-1
+```
+
+**推送 WASM 模块：**
+
+```bash
+creek_admin --target 127.0.0.1:9000 push-wasm my_filter ./filter.wasm
+# 输出: wasm module pushed: id=1
+```
+
+**列出已加载模块：**
+
+```bash
+creek_admin --target 127.0.0.1:9000 list-wasm
+# 输出:
+#   id=1 name=my_filter size=4096
+#   id=2 name=validator size=8192
+```
+
+**卸载 WASM 模块：**
+
+```bash
+creek_admin --target 127.0.0.1:9000 unload-wasm 1
+# 输出: wasm module 1 unloaded
+```
+
+**查询指标：**
+
+```bash
+creek_admin --target 127.0.0.1:9000 metrics
+# 输出:
+#   client_to_leaf/SayHello: calls=42 errors=0 bytes=1680 latency=15200
+```

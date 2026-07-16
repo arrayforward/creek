@@ -376,3 +376,75 @@ graph TD
     RR --> RET
     REBIND --> RET
 ```
+
+## 7. 声明式路由控制面
+
+### Admin gRPC API
+
+Leaf 侧通过 `Admin` gRPC 服务暴露五个新接口，供运维工具远程控制路由行为：
+
+| 接口 | 说明 |
+|---|---|
+| `PushWasm` | 向指定 Leaf 推送 `.wasm` 模块，支持热加载 |
+| `ListWasm` | 查询已加载的 WASM 模块列表及版本 |
+| `UnloadWasm` | 卸载指定的 WASM 模块 |
+| `SetRouteRule` | 声明式配置路由规则（匹配条件 → WASM 或内置策略） |
+| `GetRouteTable` | 查询当前生效的路由表 |
+
+所有接口通过 gRPC 双向流传输，支持批量推送和实时状态反馈。
+
+### creek_admin_client CLI
+
+`creek_admin_client` 是配套的命令行管理工具，通过 gRPC 连接 Leaf 的 Admin 服务：
+
+```bash
+# 推送路由 WASM 模块到 Leaf
+creek_admin_client --leaf 127.0.0.1:30009 push-wasm \
+    --name "rate_limit" \
+    --file ./wasm/rate_limit.wasm
+
+# 列出 Leaf 上已加载的 WASM 模块
+creek_admin_client --leaf 127.0.0.1:30009 list-wasm
+
+# 卸载指定模块
+creek_admin_client --leaf 127.0.0.1:30009 unload-wasm \
+    --name "rate_limit"
+
+# 设置路由规则
+creek_admin_client --leaf 127.0.0.1:30009 set-rule \
+    --match "service=creek.v1.Greeter" \
+    --action "wasm:rate_limit" \
+    --priority 100
+
+# 查看路由表
+creek_admin_client --leaf 127.0.0.1:30009 get-routes
+```
+
+### WASM 热加载流程
+
+```mermaid
+sequenceDiagram
+    participant Admin as creek_admin_client
+    participant Leaf as Leaf (gRPC Admin)
+    participant Store as WASM Store
+    participant Router as Route Engine
+    participant Node as Node
+
+    Admin->>Leaf: PushWasm(name, wasm_bytes, version)
+    Leaf->>Store: 校验 WASM 签名与版本
+    Store-->>Leaf: 签名有效，保存到本地
+    Leaf->>Leaf: 预编译 WASM 模块
+    Leaf-->>Admin: PushWasmResponse(ok, module_id)
+
+    Admin->>Leaf: SetRouteRule(match, action="wasm:rate_limit", priority)
+    Leaf->>Router: 注册路由规则
+    Router->>Store: 加载 WASM 实例
+    Store-->>Router: WASM 实例句柄
+    Router-->>Leaf: 规则生效
+    Leaf-->>Admin: SetRouteRuleResponse(ok)
+
+    Note over Leaf,Node: 新请求到达时路由引擎按优先级匹配规则
+    Note over Leaf,Node: 命中规则后调用 WASM 模块处理请求/响应
+```
+
+WASM 模块在 Leaf 进程内以沙箱方式运行，支持请求改写、限流、鉴权等自定义逻辑。模块更新后旧版本实例通过 RCU（Read-Copy-Update）无锁替换，不中断正在处理的请求。
