@@ -209,7 +209,7 @@ creek/
 
 - **S3 / Kafka Backend 注册** — Backend 可注册为非 gRPC 端点，Leaf 自动适配协议
 - **多集群 Federation** — 多 DataCenter 跨集群路由，区域感知就近转发
-- **WASM 自定义过滤器** — 用户编写 AssemblyScript/Rust 编译为 .wasm，通过 Admin API 推送加载
+- **智能重试策略** — 基于 CircuitBreaker 状态的自适应重试（幂等请求自动重试，非幂等请求跳过）
 
 ### 远期 (v1.0)
 

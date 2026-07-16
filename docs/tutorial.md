@@ -309,3 +309,118 @@ gRPC 入口: client-leaf :9000
 ## 清理
 
 在所有终端中按 `Ctrl+C` 停止进程。Node 和 Leaf 会优雅退出（发送 Bye 消息）。
+
+## 9. WASM 自定义过滤器
+
+### 概述
+
+Creek 支持用户通过 AssemblyScript/Rust 编写自定义 WASM 过滤器，编译为 `.wasm` 后通过 Admin API 推送加载到 Leaf 中。过滤器在请求和响应阶段被调用，可用于修改元数据、记录日志、注入延迟等场景。
+
+### 步骤 1：安装 WABT
+
+```bash
+pacman -S mingw-w64-x86_64-wabt
+```
+
+安装完成后验证：
+
+```bash
+wat2wasm --version
+```
+
+### 步骤 2：编写 sample_filter.wat
+
+创建 `sample_filter.wat` 文件，内容参考 `tools/sample_filter.wat`。关键部分如下：
+
+```wasm
+(module
+  ;; Host Import：宿主提供的函数
+  (import "env" "creek_get_metadata" (func $creek_get_metadata (param i32 i32) (result i32)))
+  (import "env" "creek_set_metadata" (func $creek_set_metadata (param i32 i32 i32 i32)))
+  (import "env" "creek_sleep"        (func $creek_sleep (param i32)))
+  (import "env" "creek_random"       (func $creek_random (result i32)))
+  (import "env" "creek_log"          (func $creek_log (param i32 i32)))
+
+  (memory (export "memory") 1)
+
+  ;; 预置字符串数据
+  (data (i32.const 0) "ok")
+  (data (i32.const 20) "true")
+  (data (i32.const 30) "mirror")
+  (data (i32.const 50) "[wasm] on_request ok")
+  (data (i32.const 80) "[wasm] on_response ok")
+
+  ;; 请求回调：设置元数据 "ok"="true" 并打印日志
+  (func (export "on_request") (param $svc i32) (param $method i32) (param $meta_ptr i32) (param $out_ptr i32)
+    (i32.store8 (i32.add (local.get $out_ptr) (i32.const 0)) (i32.const 1))
+    (call $creek_set_metadata (i32.const 0) (i32.const 2) (i32.const 20) (i32.const 4))
+    (call $creek_log (i32.const 50) (i32.const 21))
+  )
+
+  ;; 响应回调：设置元数据 "mirror"="true" 并打印日志
+  (func (export "on_response") (param $status i32) (param $meta_ptr i32) (param $out_ptr i32)
+    (call $creek_set_metadata (i32.const 30) (i32.const 6) (i32.const 20) (i32.const 4))
+    (call $creek_log (i32.const 80) (i32.const 22))
+  )
+)
+```
+
+### 步骤 3：编译为 WASM
+
+```bash
+wat2wasm sample_filter.wat -o sample_filter.wasm
+```
+
+### 步骤 4：推送加载
+
+```bash
+creek_admin_client --target 127.0.0.1:9000 push-wasm my_filter sample_filter.wasm
+```
+
+预期输出：
+
+```
+wasm module pushed: id=1
+```
+
+### 步骤 5：验证加载
+
+```bash
+creek_admin_client --target 127.0.0.1:9000 list-wasm
+```
+
+预期输出：
+
+```
+  id=1 name=my_filter size=xxx
+```
+
+### 完整命令序列
+
+```bash
+# 1. 安装 WABT 工具链
+pacman -S mingw-w64-x86_64-wabt
+
+# 2. 编译 WAT → WASM
+wat2wasm tools/sample_filter.wat -o sample_filter.wasm
+
+# 3. 推送过滤器到 Leaf
+creek_admin_client --target 127.0.0.1:9000 push-wasm my_filter sample_filter.wasm
+
+# 4. 列出已加载的 WASM 模块
+creek_admin_client --target 127.0.0.1:9000 list-wasm
+
+# 5. 卸载过滤器
+creek_admin_client --target 127.0.0.1:9000 unload-wasm 1
+```
+
+### 预期输出说明
+
+推送成功后会返回分配的模块 ID。之后发起的 gRPC/JSON-RPC 请求经过该 Leaf 时，`on_request` 和 `on_response` 回调将被依次调用，可在 Leaf 日志中看到：
+
+```
+[wasm] on_request ok
+[wasm] on_response ok
+```
+
+同时元数据 `ok`、`mirror` 会被注入到请求/响应上下文中。

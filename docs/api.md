@@ -544,4 +544,45 @@ creek_admin --target 127.0.0.1:9000 unload-wasm 1
 creek_admin --target 127.0.0.1:9000 metrics
 # 输出:
 #   client_to_leaf/SayHello: calls=42 errors=0 bytes=1680 latency=15200
+
+### 构建 WASM 过滤器
+
+#### 安装 WABT
+
+```bash
+pacman -S mingw-w64-x86_64-wabt
+```
+
+#### 编写 .wat 文件
+
+参考 `tools/sample_filter.wat` 示例，编写 WASM 文本格式的过滤器。示例文件定义了两个导出函数：
+
+- `on_request(svc, method, meta_ptr, out_ptr)`：请求阶段回调，在请求转发到 Backend 前调用
+- `on_response(status, meta_ptr, out_ptr)`：响应阶段回调，在收到 Backend 响应后调用
+
+完整示例内容见 `tools/sample_filter.wat`。
+
+#### 编译
+
+```bash
+wat2wasm sample_filter.wat -o sample_filter.wasm
+```
+
+#### 推送
+
+```bash
+creek_admin_client --target HOST:PORT push-wasm my_filter sample_filter.wasm
+```
+
+#### Host Import 接口表
+
+WASM 过滤器通过 `env` 模块导入以下宿主函数：
+
+| 函数签名 | 说明 |
+|---|---|
+| `creek_get_metadata(key_ptr: i32, key_len: i32) -> i32` | 获取元数据：`key_ptr` 为 key 字符串指针，`key_len` 为 key 长度；返回值表示读取到的 value 长度 |
+| `creek_set_metadata(key_ptr: i32, key_len: i32, value_ptr: i32, value_len: i32)` | 设置元数据：写入 key-value 对到请求/响应上下文中 |
+| `creek_sleep(ms: i32)` | 阻塞当前过滤器执行指定毫秒数 |
+| `creek_random() -> i32` | 返回一个随机 32 位整数 |
+| `creek_log(msg_ptr: i32, msg_len: i32)` | 输出日志消息到宿主 Leaf 的日志系统 |
 ```
