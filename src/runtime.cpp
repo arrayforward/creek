@@ -2,6 +2,7 @@
 
 #include "creek.pb.h"
 #include "creek.grpc.pb.h"
+#include "creek/circuit_breaker.hpp"
 #include "creek/json_rpc.hpp"
 #include "creek/metrics.hpp"
 #include "creek/redis.hpp"
@@ -1149,6 +1150,12 @@ public:
             if (!ep_opt) break;
             if (!tried.insert(ep_opt->endpoint_id()).second) break;
             const creek::v1::Endpoint& ep = *ep_opt;
+            if (!breaker_.allow(ep.endpoint_id())) {
+                std::fprintf(stderr, "[creek-leaf] circuit open ep=%s\n", ep.endpoint_id().c_str());
+                std::fflush(stderr);
+                last_status = grpc::Status(grpc::StatusCode::UNAVAILABLE, "circuit_open");
+                continue;
+            }
             grpc::Status status(grpc::StatusCode::UNAVAILABLE, "no_backend");
             std::uint64_t latency = 0;
             std::size_t out_bytes = 0;
@@ -1159,9 +1166,15 @@ public:
             }
             last_status = status;
             if (status.ok()) {
+                breaker_.record_success(ep.endpoint_id(), latency);
                 record_metric("client_to_leaf", "SayHello",
                               static_cast<std::uint64_t>(request.ByteSizeLong()), 0, true, metadata);
                 return status;
+            }
+            if (status.error_code() != static_cast<int>(grpc::StatusCode::UNAVAILABLE) ||
+                (status.error_message() != "no_endpoint" && status.error_message() != "no_backend" &&
+                 status.error_message() != "leaf_not_found" && status.error_message() != "circuit_open")) {
+                breaker_.record_failure(ep.endpoint_id());
             }
             {
                 std::lock_guard<std::mutex> lk(mutex_);
@@ -1450,6 +1463,7 @@ public:
     std::unique_ptr<JsonRpcHttpServer> json_rpc_server_;
     EndpointDirectory directory_;
     StickyBalancer balancer_;
+    CircuitBreaker breaker_;
     std::unique_ptr<grpc::Server> grpc_server_;
     std::unique_ptr<GreeterService> greeter_service_;
     std::unique_ptr<LeafControlService> leaf_control_service_;
