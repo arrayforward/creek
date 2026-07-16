@@ -3,6 +3,7 @@
 #include "creek.pb.h"
 #include "creek.grpc.pb.h"
 #include "creek/circuit_breaker.hpp"
+#include "creek/wasm_runtime.hpp"
 #include "creek/json_rpc.hpp"
 #include "creek/metrics.hpp"
 #include "creek/redis.hpp"
@@ -532,6 +533,21 @@ public:
     ::grpc::Status Metrics(::grpc::ServerContext* context,
                            const ::creek::v1::MetricRequest* request,
                            ::creek::v1::MetricReply* response) override;
+    ::grpc::Status SetStickyStrategy(::grpc::ServerContext* context,
+                                     const ::creek::v1::StickyStrategyRequest* request,
+                                     ::creek::v1::StickyStrategyReply* response) override;
+    ::grpc::Status SetBreakerConfig(::grpc::ServerContext* context,
+                                    const ::creek::v1::BreakerConfigRequest* request,
+                                    ::creek::v1::BreakerConfigReply* response) override;
+    ::grpc::Status PushWasmModule(::grpc::ServerContext* context,
+                                  const ::creek::v1::PushWasmRequest* request,
+                                  ::creek::v1::PushWasmReply* response) override;
+    ::grpc::Status ListWasmModules(::grpc::ServerContext* context,
+                                   const ::creek::v1::ListWasmRequest* request,
+                                   ::creek::v1::ListWasmReply* response) override;
+    ::grpc::Status UnloadWasmModule(::grpc::ServerContext* context,
+                                    const ::creek::v1::UnloadWasmRequest* request,
+                                    ::creek::v1::UnloadWasmReply* response) override;
 private:
     LeafRuntime::Impl* impl_;
 };
@@ -1300,6 +1316,84 @@ public:
         return grpc::Status::OK;
     }
 
+    grpc::Status handle_set_sticky(::grpc::ServerContext* context,
+                                   const ::creek::v1::StickyStrategyRequest* request,
+                                   ::creek::v1::StickyStrategyReply* response) {
+        (void)context;
+        std::lock_guard<std::mutex> lk(mutex_);
+        if (request->strategy() == 0) {
+            balancer_.set_shard_key("");
+        }
+        if (request->ttl_ms() > 0) {
+            balancer_.set_ttl(std::chrono::milliseconds(request->ttl_ms()));
+        }
+        response->set_accepted(true);
+        return grpc::Status::OK;
+    }
+
+    grpc::Status handle_set_breaker(::grpc::ServerContext* context,
+                                    const ::creek::v1::BreakerConfigRequest* request,
+                                    ::creek::v1::BreakerConfigReply* response) {
+        (void)context;
+        std::lock_guard<std::mutex> lk(mutex_);
+        if (!request->endpoint_id().empty()) {
+            breaker_.reset(request->endpoint_id());
+        } else {
+            breaker_.reset_all();
+        }
+        response->set_accepted(true);
+        return grpc::Status::OK;
+    }
+
+    grpc::Status handle_push_wasm(::grpc::ServerContext* context,
+                                  const ::creek::v1::PushWasmRequest* request,
+                                  ::creek::v1::PushWasmReply* response) {
+        (void)context;
+        try {
+            Bytes wasm_bytes(request->wasm_bytes().begin(), request->wasm_bytes().end());
+            uint32_t id = WasmRuntime::instance().load_module(wasm_bytes);
+            std::lock_guard<std::mutex> lk(mutex_);
+            loaded_wasm_ids_.push_back(id);
+            response->set_accepted(true);
+            response->set_module_id(id);
+        } catch (const std::exception& e) {
+            response->set_accepted(false);
+            response->set_error(e.what());
+        }
+        return grpc::Status::OK;
+    }
+
+    grpc::Status handle_list_wasm(::grpc::ServerContext* context,
+                                  const ::creek::v1::ListWasmRequest* request,
+                                  ::creek::v1::ListWasmReply* response) {
+        (void)context;
+        (void)request;
+        std::lock_guard<std::mutex> lk(mutex_);
+        for (auto id : loaded_wasm_ids_) {
+            auto* info = response->add_modules();
+            info->set_module_id(id);
+            info->set_name("wasm_" + std::to_string(id));
+            info->set_size(0);
+        }
+        return grpc::Status::OK;
+    }
+
+    grpc::Status handle_unload_wasm(::grpc::ServerContext* context,
+                                    const ::creek::v1::UnloadWasmRequest* request,
+                                    ::creek::v1::UnloadWasmReply* response) {
+        (void)context;
+        std::lock_guard<std::mutex> lk(mutex_);
+        auto it = std::find(loaded_wasm_ids_.begin(), loaded_wasm_ids_.end(), request->module_id());
+        if (it != loaded_wasm_ids_.end()) {
+            loaded_wasm_ids_.erase(it);
+            response->set_accepted(true);
+        } else {
+            response->set_accepted(false);
+            response->set_error("module not found");
+        }
+        return grpc::Status::OK;
+    }
+
     void redis_sync_loop() {
         while (running_.load()) {
             try {
@@ -1482,6 +1576,7 @@ public:
     std::set<std::string> parent_ids_;
     std::string active_parent_;
     std::atomic<bool> all_parents_down_{true};
+    std::vector<uint32_t> loaded_wasm_ids_;
     std::uint64_t version_counter_{};
 };
 
@@ -1513,6 +1608,36 @@ public:
                                      const ::creek::v1::MetricRequest* request,
                                      ::creek::v1::MetricReply* response) {
     return impl_->handle_metrics(context, request, response);
+}
+
+::grpc::Status AdminService::SetStickyStrategy(::grpc::ServerContext* context,
+                                               const ::creek::v1::StickyStrategyRequest* request,
+                                               ::creek::v1::StickyStrategyReply* response) {
+    return impl_->handle_set_sticky(context, request, response);
+}
+
+::grpc::Status AdminService::SetBreakerConfig(::grpc::ServerContext* context,
+                                              const ::creek::v1::BreakerConfigRequest* request,
+                                              ::creek::v1::BreakerConfigReply* response) {
+    return impl_->handle_set_breaker(context, request, response);
+}
+
+::grpc::Status AdminService::PushWasmModule(::grpc::ServerContext* context,
+                                            const ::creek::v1::PushWasmRequest* request,
+                                            ::creek::v1::PushWasmReply* response) {
+    return impl_->handle_push_wasm(context, request, response);
+}
+
+::grpc::Status AdminService::ListWasmModules(::grpc::ServerContext* context,
+                                             const ::creek::v1::ListWasmRequest* request,
+                                             ::creek::v1::ListWasmReply* response) {
+    return impl_->handle_list_wasm(context, request, response);
+}
+
+::grpc::Status AdminService::UnloadWasmModule(::grpc::ServerContext* context,
+                                              const ::creek::v1::UnloadWasmRequest* request,
+                                              ::creek::v1::UnloadWasmReply* response) {
+    return impl_->handle_unload_wasm(context, request, response);
 }
 
 NodeRuntime::NodeRuntime(NodeConfig config) : impl_(std::make_unique<Impl>(std::move(config))) {}

@@ -39,6 +39,7 @@ public:
         const std::vector<creek::v1::Endpoint>& endpoints,
         SteadyClock::time_point now = SteadyClock::now());
     void invalidate(std::string_view endpoint_id);
+    void set_ttl(std::chrono::milliseconds ttl);
     std::size_t active_size() const;
     std::size_t lru_size() const;
     void set_shard_key(const std::string& key);

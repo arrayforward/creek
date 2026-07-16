@@ -255,6 +255,12 @@ std::size_t StickyBalancer::lru_size() const {
     return count;
 }
 
+void StickyBalancer::set_ttl(std::chrono::milliseconds ttl) {
+    std::lock_guard<std::mutex> lk(mutex_);
+    ttl_ = ttl;
+    entries_.clear();
+}
+
 void StickyBalancer::set_shard_key(const std::string& key) {
     (void)key;
 }

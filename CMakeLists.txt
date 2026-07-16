@@ -125,6 +125,9 @@ target_link_libraries(creek_hello_server PRIVATE creek_core)
 add_executable(creek_hello_client "${CMAKE_CURRENT_SOURCE_DIR}/apps/hello_client.cpp")
 target_link_libraries(creek_hello_client PRIVATE creek_proto)
 
+add_executable(creek_admin_client "${CMAKE_CURRENT_SOURCE_DIR}/apps/admin_client.cpp")
+target_link_libraries(creek_admin_client PRIVATE creek_proto)
+
 enable_testing()
 file(GLOB CREEK_UNIT_TEST_SOURCES CONFIGURE_DEPENDS
     "${CMAKE_CURRENT_SOURCE_DIR}/tests/*.cpp"

@@ -121,4 +121,66 @@ message MetricReply {
 
 service Admin {
   rpc Metrics(MetricRequest) returns (MetricReply);
+  rpc SetStickyStrategy(StickyStrategyRequest) returns (StickyStrategyReply);
+  rpc SetBreakerConfig(BreakerConfigRequest) returns (BreakerConfigReply);
+  rpc PushWasmModule(PushWasmRequest) returns (PushWasmReply);
+  rpc ListWasmModules(ListWasmRequest) returns (ListWasmReply);
+  rpc UnloadWasmModule(UnloadWasmRequest) returns (UnloadWasmReply);
+}
+
+message StickyStrategyRequest {
+  string service = 1;
+  int32 strategy = 2;
+  int64 ttl_ms = 3;
+}
+
+message StickyStrategyReply {
+  bool accepted = 1;
+  string error = 2;
+}
+
+message BreakerConfigRequest {
+  string endpoint_id = 1;
+  int64 cooldown_ms = 2;
+  int64 latency_threshold_us = 3;
+  double error_rate_threshold = 4;
+  int32 consecutive_failure_threshold = 5;
+}
+
+message BreakerConfigReply {
+  bool accepted = 1;
+  string error = 2;
+}
+
+message PushWasmRequest {
+  string module_name = 1;
+  bytes wasm_bytes = 2;
+}
+
+message PushWasmReply {
+  bool accepted = 1;
+  uint32 module_id = 2;
+  string error = 3;
+}
+
+message ListWasmRequest {
+}
+
+message ListWasmReply {
+  repeated WasmModuleInfo modules = 1;
+}
+
+message WasmModuleInfo {
+  uint32 module_id = 1;
+  string name = 2;
+  int64 size = 3;
+}
+
+message UnloadWasmRequest {
+  uint32 module_id = 1;
+}
+
+message UnloadWasmReply {
+  bool accepted = 1;
+  string error = 2;
 }
