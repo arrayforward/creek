@@ -586,3 +586,41 @@ WASM 过滤器通过 `env` 模块导入以下宿主函数：
 | `creek_random() -> i32` | 返回一个随机 32 位整数 |
 | `creek_log(msg_ptr: i32, msg_len: i32)` | 输出日志消息到宿主 Leaf 的日志系统 |
 ```
+
+---
+
+## 分布式追踪 (Trace Context)
+
+Creek 在请求全链路中注入 W3C Trace Context 头，支持与 OpenTelemetry / Jaeger 等系统集成。
+
+### 传递的 Header
+
+| Header | 示例值 | 说明 |
+|---|---|---|
+| `traceparent` | `00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01` | W3C 标准，`version-trace_id-span_id-flags` |
+| `tracestate` | `creek=op:7` | 供应商扩展，键值对 |
+
+### gRPC 调用示例
+
+```cpp
+grpc::ClientContext ctx;
+ctx.AddMetadata("traceparent", "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01");
+
+creek::v1::HelloReply reply;
+auto status = stub->SayHello(&ctx, request, &reply);
+```
+
+### JSON-RPC 调用示例
+
+```http
+POST /rpc HTTP/1.1
+Host: 127.0.0.1:9000
+Content-Type: application/json
+traceparent: 00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01
+
+{"jsonrpc":"2.0","id":"1","method":"SayHello","params":{"name":"trace"}}
+```
+
+### 自动生成
+
+当请求**未携带** `traceparent` 时，Entry Leaf 会自动生成唯一的 `trace_id`（32 hex）和 root `span_id`（16 hex），并贯穿整个 Tight Mesh。每个 hop（Leaf → Node → Leaf → Backend）都会创建新的 child `span_id`。

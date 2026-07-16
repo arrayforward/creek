@@ -201,7 +201,6 @@ creek/
 
 ### 即将发布 (v0.5)
 
-- ~~**W3C Trace Context 传播**~~ — ✅ Tight 链路注入 traceparent/tracestate，全链路追踪
 - **gRPC-JSON 转码桥** — Leaf 内置 HTTP/1.1 RESTful API → gRPC 自动转码，无需 Envoy filter
 - **自适应健康检查** — 基于 CircuitBreaker 统计的后端健康评分，主动摘除亚健康节点
 

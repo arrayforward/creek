@@ -448,3 +448,60 @@ sequenceDiagram
 ```
 
 WASM 模块在 Leaf 进程内以沙箱方式运行，支持请求改写、限流、鉴权等自定义逻辑。模块更新后旧版本实例通过 RCU（Read-Copy-Update）无锁替换，不中断正在处理的请求。
+
+---
+
+## 8. W3C Trace Context 分布式追踪
+
+Creek 在 Tight Mesh 全链路中注入 W3C Trace Context，支持与 OpenTelemetry / Jaeger / Zipkin 等追踪系统集成。
+
+### Trace Context 格式
+
+`traceparent` 头遵循 W3C 标准格式：
+
+```
+traceparent: 00-{trace_id(32 hex)}-{span_id(16 hex)}-{flags(2 hex)}
+tracestate: vendor-specific key=value pairs
+```
+
+### 传播链路
+
+```mermaid
+sequenceDiagram
+    participant C as Client
+    participant EL as Entry Leaf
+    participant N1 as Node-1
+    participant N2 as Node-2
+    participant SL as Service Leaf
+    participant B as Backend
+
+    C->>EL: traceparent: 00-tid-span0-01
+    EL->>EL: create child span1
+    EL->>N1: RoutedRequest (traceparent=tid-span1-01)
+    N1->>N2: RoutedRequest (透传 metadata)
+    N2->>SL: RoutedRequest (透传 metadata)
+    SL->>SL: create child span2
+    SL->>B: gRPC SayHello
+    B-->>SL: response
+    SL-->>N2: RoutedResponse
+    N2-->>N1: RoutedResponse
+    N1-->>EL: RoutedResponse
+    EL-->>C: HelloReply
+```
+
+### 集成方式
+
+- **gRPC 入口**：从 `ClientContext` metadata 提取 `traceparent`/`tracestate`
+- **JSON-RPC 入口**：从 HTTP Header 提取同名字段
+- **Tight 传播**：`send_routed_request` 自动将 metadata（含 trace 字段）拷贝到 `RoutedRequest`
+- **后端出口**：`handle_inbound_request` 在调用 Backend 前创建 child span 并打印日志
+- **日志格式**：`[trace] leaf_backend: trace_id=... span_id=... ep=...`
+
+### API
+
+```cpp
+TraceSpan TraceContext::parse_traceparent("00-{trace_id}-{span_id}-01");
+TraceSpan child = TraceContext::create_child(parent); // 新 span_id
+```
+
+当请求未携带 `traceparent` 时，Entry Leaf 自动生成 `trace_id` 和 root `span_id`。
