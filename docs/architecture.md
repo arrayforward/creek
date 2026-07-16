@@ -180,9 +180,12 @@ stateDiagram-v2
     Handshake --> Handshake: 定时重发
 ```
 
-**FEC 纠删码：**
+**FEC 自适应纠删码：**
 
-每个消息被分为 N-1 个数据分片和 1 个奇偶校验分片。任意丢失一个分片可通过 Reed-Solomon XOR 恢复。
+每个消息被分为多个数据分片，根据当前 RTT 动态决定校验片数量：
+- RTT < 5ms → 1 校验片（可恢复 1 个丢失分片）
+- RTT 5-20ms → 2 校验片（旋转 XOR，可恢复多个丢失分片）
+- 校验片通过 Reed-Solomon XOR 算法生成，旋转分组实现多片独立恢复
 
 **Token Bucket 速率控制：**
 
