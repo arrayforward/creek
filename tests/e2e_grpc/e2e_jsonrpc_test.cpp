@@ -63,7 +63,7 @@ std::string build_cmd(const std::string& exe, const std::vector<std::string>& ar
 
 bool tcp_connect_ok(const std::string& host, int port, int timeout_ms) {
 #ifdef _WIN32
-    SOCKET s = ::socket(AF_INET, SOCK_STREAM, IPPROTO_UDP);
+    SOCKET s = ::socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
 #else
     int s = ::socket(AF_INET, SOCK_STREAM, 0);
 #endif

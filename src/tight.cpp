@@ -395,7 +395,7 @@ public:
         Peer* peer;
         Bytes datagram;
     };
-    BlockingQueue<OutboundPacket> outbound_queue{8192};
+    BlockingQueue<OutboundPacket> outbound_queue{65536};
     std::thread sender_thread;
     std::atomic<bool> sender_running{false};
 
@@ -751,6 +751,7 @@ public:
     }
 
     void handle_packet(const sockaddr_in& from, const PacketHeader& header, const Bytes& payload) {
+        CREEK_LOG_DEBUG(std::string("[tight] handle_packet type=") + std::to_string((int)header.type));
         Peer* peer;
         {
             std::lock_guard<std::mutex> lock(peers_mutex);
@@ -1210,12 +1211,7 @@ public:
     // (with token-bucket back-pressure). This MUST NOT block the caller.
     void send_raw(Peer* peer, const Bytes& datagram) {
         if (!peer->addr_set || sock == kInvalidSocket) return;
-        // Make a heap copy so the caller can reuse/free its buffer.
-        Bytes copy = datagram;
-        // Best-effort enqueue; if the queue is full, drop the packet
-        // (back-pressure in the form of a dropped packet is preferable to
-        // stalling the reactor).
-        outbound_queue.try_push(OutboundPacket{peer, std::move(copy)});
+        outbound_queue.try_push(OutboundPacket{peer, Bytes(datagram)});
     }
 
     void receiver_loop() {
@@ -1432,6 +1428,9 @@ public:
                     }
                     if (pit == peers.end()) continue;
                     auto& peer = pit->second;
+                    if (payload_ptr->size() > 50) {
+                        CREEK_LOG_DEBUG(std::string("[tight] process_send peer=") + peer_id + " state=" + std::to_string((int)peer.state) + " bytes=" + std::to_string(payload_ptr->size()));
+                    }
                     if (peer.state != LinkState::Online) {
                         if (peer.state != LinkState::Closed) {
                             std::lock_guard<std::mutex> lk(send_mutex);

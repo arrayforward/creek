@@ -99,7 +99,7 @@ public:
         tc.role = LinkRole::Node;
         tc.bind = config_.udp_bind;
         tc.token = config_.token;
-        tc.dead_timeout = std::chrono::milliseconds(3000);
+        tc.dead_timeout = std::chrono::milliseconds(30000);
 
         transport_ = std::make_unique<TightTransport>(tc);
         transport_->set_message_callback([this](const std::string& peer_id, Bytes payload) {
@@ -158,6 +158,7 @@ public:
 private:
     void on_peer_event(const PeerEvent& ev) {
         std::lock_guard<std::mutex> lk(mutex_);
+        CREEK_LOG_INFO(std::string("[runtime] on_peer_event id=") + ev.id + " state=" + std::to_string((int)ev.state));
         if (ev.role == LinkRole::Leaf) {
             if (ev.state == LinkState::Closed) {
                 auto it = leaves_.find(ev.id);
@@ -179,6 +180,7 @@ private:
     }
 
     void on_message(const std::string& peer_id, Bytes payload) {
+        CREEK_LOG_DEBUG(std::string("[runtime] leaf on_message from=") + peer_id + " bytes=" + std::to_string(payload.size()));
         creek::v1::WireMessage msg;
         if (!parse_wire(payload, msg)) return;
 
@@ -610,7 +612,7 @@ public:
         tc.role = LinkRole::Leaf;
         tc.bind = config_.udp_bind;
         tc.token = config_.token;
-        tc.dead_timeout = std::chrono::milliseconds(3000);
+        tc.dead_timeout = std::chrono::milliseconds(30000);
 
         transport_ = std::make_unique<TightTransport>(tc);
         transport_->set_message_callback([this](const std::string& peer_id, Bytes payload) {
@@ -620,9 +622,11 @@ public:
             on_peer_event(ev);
         });
         if (!transport_->start()) {
+            CREEK_LOG_ERROR("[runtime] tight transport start failed");
             transport_.reset();
             return false;
         }
+        CREEK_LOG_INFO("[runtime] tight transport started");
         for (const auto& parent : config_.parents) {
             if (!parent.id.empty()) {
                 parent_ids_.insert(parent.id);
@@ -632,12 +636,15 @@ public:
 
         metrics_store_ = std::make_shared<MetricsStore>(config_.metric_period);
         metrics_server_ = std::make_unique<MetricsHttpServer>(metrics_store_, config_.metrics_bind);
+        CREEK_LOG_INFO(std::string("[runtime] starting metrics server on ") + format_address(config_.metrics_bind));
         if (!metrics_server_->start()) {
+            CREEK_LOG_ERROR("[runtime] metrics server start failed");
             metrics_server_.reset();
             transport_->stop();
             transport_.reset();
             return false;
         }
+        CREEK_LOG_INFO("[runtime] metrics server started");
 
         json_rpc_server_ = std::make_unique<JsonRpcHttpServer>(
             config_.json_bind,
@@ -645,6 +652,7 @@ public:
                 return handle_json_rpc(std::move(body), headers);
             });
         if (!json_rpc_server_->start()) {
+            CREEK_LOG_ERROR("[runtime] json_rpc server start failed");
             json_rpc_server_.reset();
             metrics_server_->stop();
             metrics_server_.reset();
@@ -652,20 +660,25 @@ public:
             transport_.reset();
             return false;
         }
+        CREEK_LOG_INFO("[runtime] json_rpc server started");
 
         greeter_service_ = std::make_unique<GreeterService>(this);
         leaf_control_service_ = std::make_unique<LeafControlService>(this);
         admin_service_ = std::make_unique<AdminService>(this);
 
         grpc::ServerBuilder builder;
+        CREEK_LOG_INFO(std::string("[runtime] building gRPC server on ") + format_address(config_.grpc_bind));
         builder.AddListeningPort(format_address(config_.grpc_bind),
                                  grpc::InsecureServerCredentials());
         builder.RegisterService(greeter_service_.get());
         builder.RegisterService(leaf_control_service_.get());
         builder.RegisterService(admin_service_.get());
         grpc::reflection::InitProtoReflectionServerBuilderPlugin();
+        CREEK_LOG_INFO("[runtime] calling BuildAndStart...");
         grpc_server_ = builder.BuildAndStart();
+        CREEK_LOG_INFO("[runtime] BuildAndStart returned");
         if (!grpc_server_) {
+            CREEK_LOG_ERROR("[runtime] gRPC server BuildAndStart returned null");
             json_rpc_server_->stop();
             json_rpc_server_.reset();
             metrics_server_->stop();
@@ -674,6 +687,7 @@ public:
             transport_.reset();
             return false;
         }
+        CREEK_LOG_INFO("[runtime] gRPC server started");
 
         running_.store(true);
         grpc_wait_thread_ = std::thread([this] {
@@ -738,6 +752,8 @@ public:
 
     void on_peer_event(const PeerEvent& ev) {
         std::lock_guard<std::mutex> lk(mutex_);
+        CREEK_LOG_INFO(std::string("[runtime] leaf on_peer_event id=") + ev.id + " state=" + std::to_string((int)ev.state) +
+                       " in_parents=" + std::to_string(parent_ids_.count(ev.id)));
         if (!parent_ids_.count(ev.id)) return;
         if (ev.state == LinkState::Online) {
             if (active_parent_.empty()) {
@@ -768,6 +784,7 @@ public:
     }
 
     void handle_directory(const creek::v1::DirectorySnapshot& snap, std::size_t raw_size) {
+        CREEK_LOG_DEBUG(std::string("[runtime] leaf handle_directory eps=") + std::to_string(snap.endpoints_size()));
         {
             std::lock_guard<std::mutex> lk(mutex_);
             directory_.merge(snap);
