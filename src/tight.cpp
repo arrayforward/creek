@@ -1,5 +1,6 @@
 #include "creek/tight.hpp"
 #include "creek/blocking_queue.hpp"
+#include "creek/logger.hpp"
 #include "creek/types.hpp"
 
 #include <algorithm>
@@ -46,6 +47,10 @@ namespace {
 constexpr std::uint32_t kMagic = 0x54474854U;
 constexpr std::uint8_t kVersion = 1;
 constexpr std::size_t kHeaderSize = 48;
+
+// Socket primitive aliases: on Windows we use the Winsock2 API (WSA*), on
+// POSIX we use the Berkeley sockets API. These wrappers keep the rest of the
+// file platform-agnostic.
 
 inline std::uint16_t to_be16(std::uint16_t v) {
     return static_cast<std::uint16_t>(((v & 0x00FFU) << 8) | ((v & 0xFF00U) >> 8));
@@ -154,16 +159,47 @@ bool resolve_address(const std::string& host, std::uint16_t port, sockaddr_in& o
 
 #ifdef _WIN32
 using NativeSocket = SOCKET;
+using SockLen = int;
 constexpr NativeSocket kInvalidSocket = INVALID_SOCKET;
+// SIO_UDP_CONNRESET (0x9800000C) is defined in newer Windows SDKs but not
+// all build environments; define it here for portability.
+#ifndef SIO_UDP_CONNRESET
+#define SIO_UDP_CONNRESET 0x9800000CUL
+#endif
 inline void close_socket(NativeSocket s) { closesocket(s); }
 inline int last_socket_error() { return WSAGetLastError(); }
 inline bool would_block(int e) { return e == WSAEWOULDBLOCK; }
+inline int creek_setsockopt(NativeSocket s, int level, int optname,
+                            const char* optval, int optlen) {
+    return ::setsockopt(s, level, optname, optval, optlen);
+}
+inline int creek_recvfrom(NativeSocket s, char* buf, int len, int flags,
+                          sockaddr* from, int* fromlen) {
+    return ::recvfrom(s, buf, len, flags, from, fromlen);
+}
+inline int creek_sendto(NativeSocket s, const char* buf, int len, int flags,
+                        const sockaddr* to, int tolen) {
+    return ::sendto(s, buf, len, flags, to, tolen);
+}
 #else
 using NativeSocket = int;
+using SockLen = socklen_t;
 constexpr NativeSocket kInvalidSocket = -1;
 inline void close_socket(NativeSocket s) { ::close(s); }
 inline int last_socket_error() { return errno; }
 inline bool would_block(int e) { return e == EWOULDBLOCK || e == EAGAIN; }
+inline int creek_setsockopt(NativeSocket s, int level, int optname,
+                            const char* optval, int optlen) {
+    return ::setsockopt(s, level, optname, optval, optlen);
+}
+inline int creek_recvfrom(NativeSocket s, char* buf, int len, int flags,
+                          sockaddr* from, int* fromlen) {
+    return ::recvfrom(s, buf, len, flags, from, fromlen);
+}
+inline int creek_sendto(NativeSocket s, const char* buf, int len, int flags,
+                        const sockaddr* to, int tolen) {
+    return ::sendto(s, buf, len, flags, to, tolen);
+}
 #endif
 
 }
@@ -351,6 +387,21 @@ public:
      BlockingQueue<EncodeTask> encode_queue{4096};
     std::thread encode_thread;
 
+    // Single-producer-multiple-consumer outbound packet queue.
+    // The sender thread drains this and calls ::sendto; reactor and encode
+    // thread only enqueue. This guarantees sendto (and any token-bucket
+    // back-pressure) never blocks the reactor or the encode thread.
+    struct OutboundPacket {
+        Peer* peer;
+        Bytes datagram;
+    };
+    BlockingQueue<OutboundPacket> outbound_queue{8192};
+    std::thread sender_thread;
+    std::atomic<bool> sender_running{false};
+
+    // Dedicated receiver thread. Calls recvfrom + handle_packet.
+    std::thread receiver_thread;
+
     struct PendingSend {
         PacketHeader header{};
         Bytes payload;
@@ -369,6 +420,7 @@ public:
     };
 
     struct Peer {
+        std::mutex mu;
         std::string id;
         sockaddr_in addr{};
         bool addr_set{false};
@@ -483,7 +535,7 @@ public:
         if (running.load()) return true;
         if (!wsa_acquire()) return false;
 
-        sock = ::socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+        sock = static_cast<NativeSocket>(::socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP));
         if (sock == kInvalidSocket) {
             wsa_release();
             return false;
@@ -503,29 +555,40 @@ public:
             return false;
         }
 
-        int bufsize = 512 * 1024;
-        ::setsockopt(sock, SOL_SOCKET, SO_RCVBUF,
-                     reinterpret_cast<const char*>(&bufsize), sizeof(bufsize));
-        ::setsockopt(sock, SOL_SOCKET, SO_SNDBUF,
-                     reinterpret_cast<const char*>(&bufsize), sizeof(bufsize));
-
-        sockaddr_in bound{};
-        socklen_t blen = sizeof(bound);
-        if (::getsockname(sock, reinterpret_cast<sockaddr*>(&bound), &blen) == 0) {
-            local_port = ntohs(bound.sin_port);
-        }
-
-        u_long nonblock = 1;
+        int bufsize = 1024 * 1024;  // 1 MiB per direction; helps burst absorption.
+        creek_setsockopt(sock, SOL_SOCKET, SO_RCVBUF,
+                         reinterpret_cast<const char*>(&bufsize), sizeof(bufsize));
+        creek_setsockopt(sock, SOL_SOCKET, SO_SNDBUF,
+                         reinterpret_cast<const char*>(&bufsize), sizeof(bufsize));
 #ifdef _WIN32
+        // On Windows, set SO_EXCLUSIVEADDRUSE off and disable WSAECONNRESET
+        // delivery on UDP sockets (we don't want ICMP unreachable errors to
+        // abort the recvfrom loop when a peer disappears mid-stream).
+        BOOL false_ = FALSE;
+        setsockopt(sock, SOL_SOCKET, SO_REUSEADDR,
+                   reinterpret_cast<const char*>(&false_), sizeof(false_));
+        // SIO_UDP_CONNRESET (0x9800000C) -- disable WSAECONNRESET errors.
+        DWORD bytes_returned = 0;
+        WSAIoctl(sock, SIO_UDP_CONNRESET, &false_, sizeof(false_),
+                  nullptr, 0, &bytes_returned, nullptr, nullptr);
+        u_long nonblock = 1;
         ioctlsocket(sock, FIONBIO, &nonblock);
 #else
         int fl = fcntl(sock, F_GETFL, 0);
         if (fl >= 0) fcntl(sock, F_SETFL, fl | O_NONBLOCK);
 #endif
 
+        sockaddr_in bound{};
+        SockLen blen = sizeof(bound);
+        if (::getsockname(sock, reinterpret_cast<sockaddr*>(&bound), &blen) == 0) {
+            local_port = ntohs(bound.sin_port);
+        }
+
         running.store(true);
         reactor_thread = std::thread([this] { run(); });
+        receiver_thread = std::thread([this] { receiver_loop(); });
         encode_thread = std::thread([this] { encode_loop(); });
+        sender_thread = std::thread([this] { sender_loop(); });
         return true;
     }
 
@@ -534,12 +597,18 @@ public:
             return;
         }
         encode_queue.close();
-        send_cv.notify_all();
+        outbound_queue.close();
         if (reactor_thread.joinable()) {
             try { reactor_thread.join(); } catch (...) {}
         }
+        if (receiver_thread.joinable()) {
+            try { receiver_thread.join(); } catch (...) {}
+        }
         if (encode_thread.joinable()) {
             try { encode_thread.join(); } catch (...) {}
+        }
+        if (sender_thread.joinable()) {
+            try { sender_thread.join(); } catch (...) {}
         }
         if (sock != kInvalidSocket) {
             close_socket(sock);
@@ -556,20 +625,10 @@ public:
         AddrKey key{addr.sin_addr.s_addr, addr.sin_port};
         auto addr_it = peer_by_addr.find(key);
         if (addr_it != peer_by_addr.end() && addr_it->second != remote.id) {
-            auto existing = peers.find(addr_it->second);
-            if (existing != peers.end()) {
-                auto target = peers.find(remote.id);
-                if (target != peers.end()) {
-                    target->second = std::move(existing->second);
-                    target->second.id = remote.id;
-                    peers.erase(existing);
-                } else {
-                    auto node = peers.extract(existing);
-                    node.key() = remote.id;
-                    node.mapped().id = remote.id;
-                    peers.insert(std::move(node));
-                }
-            }
+            // Remove the old peer entry; the new add_peer below will create a fresh one.
+            // We can't move a Peer (it holds a mutex), so we just erase and recreate.
+            std::string old_id = addr_it->second;
+            peers.erase(old_id);
             addr_it->second = remote.id;
         }
         auto& peer = peers[remote.id];
@@ -616,25 +675,23 @@ public:
     }
 
     void run() {
+        // Reactor runs business logic only; IO is done by receiver/sender threads.
+        auto next_tick = std::chrono::steady_clock::now();
         while (running.load(std::memory_order_acquire)) {
-            fd_set read_fds;
-            FD_ZERO(&read_fds);
-            FD_SET(sock, &read_fds);
-            timeval tv;
-            tv.tv_sec = 0;
-            tv.tv_usec = static_cast<long>(std::chrono::duration_cast<std::chrono::microseconds>(
-                config.flush_interval).count());
-            if (tv.tv_usec <= 0) tv.tv_usec = 10000;
-            int ready = ::select(0, &read_fds, nullptr, nullptr, &tv);
-            if (ready > 0 && FD_ISSET(sock, &read_fds)) {
-                receive_datagrams();
-            }
-            refill_token_bucket();
             send_handshakes();
             send_heartbeats();
             send_reports();
             check_offline();
             process_send_queue();
+            // Sleep until the next tick to avoid spinning.
+            next_tick += config.flush_interval;
+            auto now = std::chrono::steady_clock::now();
+            if (now < next_tick) {
+                std::this_thread::sleep_for(next_tick - now);
+            } else {
+                // We're behind schedule; yield to let other threads run.
+                std::this_thread::yield();
+            }
         }
     }
 
@@ -766,6 +823,9 @@ public:
         peer->role = role_byte == static_cast<std::uint8_t>(LinkRole::Node)
                          ? LinkRole::Node
                          : LinkRole::Leaf;
+        if (!peer->reconnect && peer->addr_set) {
+            send_handshake(peer);
+        }
         if (peer->state != LinkState::Established && peer->state != LinkState::Online) {
             peer->state = LinkState::Established;
             fire_peer_event(peer, LinkState::Established);
@@ -893,6 +953,12 @@ public:
             parts.reserve(data_count);
             real_sizes.reserve(data_count);
             for (std::size_t i = 0; i < data_count; ++i) {
+                if (!in.fragments[i].has_value()) {
+                    CREEK_LOG_DEBUG(std::string("[tight] try_assemble missing frag i=") + std::to_string(i) +
+                                     " data_count=" + std::to_string(data_count) +
+                                     " total=" + std::to_string(in.total_count));
+                    return false;  // race; retry next fragment
+                }
                 parts.push_back(*in.fragments[i]);
                 real_sizes.push_back(in.sizes[i]);
             }
@@ -920,6 +986,7 @@ public:
             if (!in.fragments[i].has_value()) missing_indices.push_back(i);
         }
         for (std::size_t p = 0; p < parity_count && !missing_indices.empty(); ++p) {
+            if (data_count + p >= in.fragments.size()) continue;
             if (!in.fragments[data_count + p].has_value()) continue;
             Bytes parity_data = *in.fragments[data_count + p];
             std::vector<Bytes> rotated(data_count);
@@ -952,13 +1019,23 @@ public:
     void handle_ack(Peer* peer, const PacketHeader& header) {
         std::uint32_t ack = header.acknowledgment;
         if (ack == 0) return;
-        auto it = peer->pending.find(ack);
-        if (it == peer->pending.end()) return;
+        std::size_t erased_bytes = 0;
+        std::chrono::steady_clock::time_point last_send;
+        bool found = false;
+        {
+            std::lock_guard<std::mutex> lock(peer->mu);
+            auto it = peer->pending.find(ack);
+            if (it == peer->pending.end()) return;
+            last_send = it->second.last_send;
+            erased_bytes = it->second.bytes;
+            peer->pending.erase(it);
+            found = true;
+        }
+        if (!found) return;
         auto rtt = std::chrono::duration_cast<std::chrono::microseconds>(
-            std::chrono::steady_clock::now() - it->second.last_send);
+            std::chrono::steady_clock::now() - last_send);
         if (rtt.count() < 0) rtt = std::chrono::microseconds(0);
-        bandwidth.on_ack(it->second.bytes, rtt);
-        peer->pending.erase(it);
+        bandwidth.on_ack(erased_bytes, rtt);
     }
 
     void handle_report(Peer* peer, const PacketHeader& header, const Bytes& payload) {
@@ -985,12 +1062,15 @@ public:
             bandwidth.on_ack(64, rtt_us);
         }
 
-        double p = static_cast<double>(delay_ratio) / 10000.0;
-        if (p <= 0.0 || p >= 1.0) {
-            peer->delay_entropy = 0.0;
-        } else {
-            double h = -p * std::log2(p) - (1.0 - p) * std::log2(1.0 - p);
-            peer->delay_entropy = h;
+        {
+            std::lock_guard<std::mutex> lock(peer->mu);
+            double p = static_cast<double>(delay_ratio) / 10000.0;
+            if (p <= 0.0 || p >= 1.0) {
+                peer->delay_entropy = 0.0;
+            } else {
+                double h = -p * std::log2(p) - (1.0 - p) * std::log2(1.0 - p);
+                peer->delay_entropy = h;
+            }
         }
 
         std::set<std::uint32_t> lost_seqs;
@@ -1000,21 +1080,34 @@ public:
             lost_seqs.insert(to_be32(lost_be));
         }
 
-        for (auto it = peer->pending.begin(); it != peer->pending.end();) {
-            if (it->first <= ack_seq && !lost_seqs.count(it->first)) {
-                it = peer->pending.erase(it);
-            } else {
-                ++it;
+        // Snapshot pending under lock, then do the work without holding the lock.
+        std::map<std::uint32_t, PendingSend> snapshot;
+        {
+            std::lock_guard<std::mutex> lock(peer->mu);
+            for (auto& kv : peer->pending) {
+                if (kv.first <= ack_seq && !lost_seqs.count(kv.first)) {
+                    continue;
+                }
+                if (lost_seqs.count(kv.first) && kv.second.retries < 10) {
+                    snapshot[kv.first] = kv.second;
+                }
+            }
+            for (auto it = peer->pending.begin(); it != peer->pending.end();) {
+                if (it->first <= ack_seq && !lost_seqs.count(it->first)) {
+                    it = peer->pending.erase(it);
+                } else {
+                    ++it;
+                }
             }
         }
 
         auto now = std::chrono::steady_clock::now();
-        for (auto seq : lost_seqs) {
-            auto it = peer->pending.find(seq);
-            if (it != peer->pending.end()) {
-                if (it->second.retries >= 10) continue;
-                Bytes datagram = PacketCodec::encode(it->second.header, it->second.payload);
-                send_raw(peer, datagram);
+        for (auto& kv : snapshot) {
+            Bytes datagram = PacketCodec::encode(kv.second.header, kv.second.payload);
+            send_raw(peer, datagram);
+            std::lock_guard<std::mutex> lock(peer->mu);
+            auto it = peer->pending.find(kv.first);
+            if (it != peer->pending.end() && it->second.retries < 10) {
                 it->second.last_send = now;
                 ++it->second.retries;
             }
@@ -1082,43 +1175,112 @@ public:
         bool is_data = (header.type == PacketType::Data);
         header.client_id = local_client_id;
         header.session_id = local_session_id;
-        if (ackable && is_data) {
-            header.sequence = peer->sequence_out++;
+        bool is_acked_data = ackable && is_data;
+        // Brief lock: only for sequence assignment and pending insertion.
+        // send_raw is called WITHOUT any lock, so the reactor thread can run
+        // even when this thread is blocked on token-bucket back-pressure.
+        {
+            std::lock_guard<std::mutex> lock(peer->mu);
+            if (is_acked_data) {
+                header.sequence = peer->sequence_out++;
+            }
+            header.message_id = msg_id;
+            header.fragment_index = idx;
+            header.fragment_count = cnt;
+            header.reserved = real_size;
+            header.payload_size = static_cast<std::uint16_t>(payload.size());
+            header.tick = static_cast<std::uint32_t>(unix_millis() & 0xFFFFFFFFULL);
+            if (is_acked_data) {
+                auto& ps = peer->pending[header.sequence];
+                ps.header = header;
+                ps.payload = payload;
+                ps.last_send = std::chrono::steady_clock::now();
+                ps.bytes = 0;  // filled in after encode to avoid re-encoding
+            }
         }
-        header.message_id = msg_id;
-        header.fragment_index = idx;
-        header.fragment_count = cnt;
-        header.reserved = real_size;
-        header.payload_size = static_cast<std::uint16_t>(payload.size());
-        header.tick = static_cast<std::uint32_t>(unix_millis() & 0xFFFFFFFFULL);
         Bytes datagram = PacketCodec::encode(header, payload);
         send_raw(peer, datagram);
-        if (ackable && is_data) {
-            auto& ps = peer->pending[header.sequence];
-            ps.header = header;
-            ps.payload = payload;
-            ps.last_send = std::chrono::steady_clock::now();
-            ps.bytes = datagram.size();
+        if (is_acked_data) {
+            std::lock_guard<std::mutex> lock(peer->mu);
+            peer->pending[header.sequence].bytes = datagram.size();
         }
     }
 
+    // Enqueue an outbound packet. The sender thread will do the actual sendto
+    // (with token-bucket back-pressure). This MUST NOT block the caller.
     void send_raw(Peer* peer, const Bytes& datagram) {
         if (!peer->addr_set || sock == kInvalidSocket) return;
-        double cost = static_cast<double>(datagram.size());
-        refill_token_bucket();
-        while (running.load() && token_bucket < cost) {
-            auto rate = std::max<std::uint64_t>(bandwidth.bytes_per_second(), 1U);
-            auto deficit = cost - token_bucket;
-            auto wait_us = static_cast<std::uint64_t>(
-                std::max(1.0, deficit * 1000000.0 / static_cast<double>(rate)));
-            std::this_thread::sleep_for(std::chrono::microseconds(
-                std::min<std::uint64_t>(wait_us, 10000U)));
-            refill_token_bucket();
+        // Make a heap copy so the caller can reuse/free its buffer.
+        Bytes copy = datagram;
+        // Best-effort enqueue; if the queue is full, drop the packet
+        // (back-pressure in the form of a dropped packet is preferable to
+        // stalling the reactor).
+        outbound_queue.try_push(OutboundPacket{peer, std::move(copy)});
+    }
+
+    void receiver_loop() {
+        // Continuously recvfrom and dispatch to handle_packet. This
+        // guarantees the reactor thread is never blocked on socket I/O.
+        std::uint8_t buf[2048];
+        while (running.load(std::memory_order_acquire)) {
+            sockaddr_in from{};
+            SockLen flen = sizeof(from);
+            int n = creek_recvfrom(sock, reinterpret_cast<char*>(buf),
+                                   static_cast<int>(sizeof(buf)), 0,
+                                   reinterpret_cast<sockaddr*>(&from), &flen);
+            if (n < 0) {
+                int e = last_socket_error();
+                if (would_block(e)) {
+                    // Avoid busy-spin: short sleep then retry.
+                    std::this_thread::sleep_for(std::chrono::microseconds(500));
+                    continue;
+                }
+                // Other error: brief sleep to avoid hot loop, then retry.
+                std::this_thread::sleep_for(std::chrono::milliseconds(1));
+                continue;
+            }
+            if (static_cast<std::size_t>(n) < kHeaderSize) continue;
+            Bytes datagram(buf, buf + n);
+            PacketHeader header{};
+            Bytes payload;
+            if (!PacketCodec::decode(datagram, header, payload)) continue;
+            handle_packet(from, header, payload);
         }
-        if (token_bucket >= cost) token_bucket -= cost;
-        ::sendto(sock, reinterpret_cast<const char*>(datagram.data()),
-                 static_cast<int>(datagram.size()), 0,
-                 reinterpret_cast<const sockaddr*>(&peer->addr), sizeof(peer->addr));
+    }
+
+    void sender_loop() {
+        sender_running.store(true);
+        while (running.load(std::memory_order_acquire)) {
+            OutboundPacket pkt;
+            // Wait briefly for a packet.
+            auto opt = outbound_queue.take_for(std::chrono::milliseconds(10));
+            if (!opt) continue;
+            pkt = std::move(*opt);
+            // Send it with token-bucket back-pressure.
+            if (!pkt.peer->addr_set || sock == kInvalidSocket) continue;
+            double cost = static_cast<double>(pkt.datagram.size());
+            refill_token_bucket();
+            while (running.load(std::memory_order_acquire) && token_bucket < cost) {
+                auto rate = std::max<std::uint64_t>(bandwidth.bytes_per_second(), 1U);
+                auto deficit = cost - token_bucket;
+                auto wait_us = static_cast<std::uint64_t>(
+                    std::max(1.0, deficit * 1000000.0 / static_cast<double>(rate)));
+                std::this_thread::sleep_for(std::chrono::microseconds(
+                    std::min<std::uint64_t>(wait_us, 10000U)));
+                refill_token_bucket();
+            }
+            if (token_bucket >= cost) token_bucket -= cost;
+            creek_sendto(sock, reinterpret_cast<const char*>(pkt.datagram.data()),
+                         static_cast<int>(pkt.datagram.size()), 0,
+                         reinterpret_cast<const sockaddr*>(&pkt.peer->addr),
+                         static_cast<int>(sizeof(pkt.peer->addr)));
+        }
+        // Drain remaining packets on shutdown.
+        while (true) {
+            auto opt = outbound_queue.poll();
+            if (!opt) break;
+        }
+        sender_running.store(false);
     }
 
     void send_handshakes() {
@@ -1301,7 +1463,6 @@ public:
             auto task = encode_queue.take_for(config.flush_interval);
             if (!task) continue;
             try {
-                std::lock_guard<std::mutex> lock(peers_mutex);
                 fragment_and_send(task->peer, std::move(task->payload));
             } catch (...) {}
         }
@@ -1309,7 +1470,6 @@ public:
             auto task = encode_queue.poll();
             if (!task) break;
             try {
-                std::lock_guard<std::mutex> lock(peers_mutex);
                 fragment_and_send(task->peer, std::move(task->payload));
             } catch (...) {}
         }
@@ -1329,10 +1489,15 @@ public:
     void fragment_and_send(Peer* peer, Bytes payload) {
         std::size_t frag_payload = config.mtu > kHeaderSize ? config.mtu - kHeaderSize : 64;
         if (frag_payload <= 4) frag_payload = 64;
-        std::uint32_t msg_id{};
-        do {
-            msg_id = static_cast<std::uint32_t>((peer->sequence_out++) & 0x7FFFFFFFu);
-        } while (msg_id == 0);
+        std::uint32_t msg_id;
+        double delay_entropy;
+        {
+            std::lock_guard<std::mutex> lock(peer->mu);
+            do {
+                msg_id = static_cast<std::uint32_t>((peer->sequence_out++) & 0x7FFFFFFFu);
+            } while (msg_id == 0);
+            delay_entropy = peer->delay_entropy;
+        }
         std::size_t total = payload.size();
         std::uint32_t total_be = to_be32(static_cast<std::uint32_t>(total & 0xFFFFFFFFULL));
         Bytes size_prefix(4);
@@ -1355,7 +1520,7 @@ public:
             if (frags[i].size() < width) frags[i].resize(width, 0);
         }
         Bytes parity = ReedSolomon::parity(frags, width);
-        std::uint16_t parity_count = compute_parity_count(peer, data_count);
+        std::uint16_t parity_count = compute_parity_count_for(delay_entropy, data_count);
         std::vector<Bytes> parities;
         parities.push_back(parity);
         for (std::uint16_t p = 1; p < parity_count; ++p) {
@@ -1376,6 +1541,15 @@ public:
         }
     }
 
+    static std::uint16_t compute_parity_count_for(double delay_entropy, std::size_t data_count) {
+        if (delay_entropy <= 0.0001) return 1;
+        double redundancy = delay_entropy * kFecSafetyCoefficient;
+        std::uint16_t p = static_cast<std::uint16_t>(std::ceil(static_cast<double>(data_count) * redundancy));
+        if (p < 1) p = 1;
+        if (p > 3) p = 3;
+        return p;
+    }
+
     void send_byes() {
         std::lock_guard<std::mutex> lock(peers_mutex);
         if (sock == kInvalidSocket) return;
@@ -1390,9 +1564,10 @@ public:
             header.client_id = local_client_id;
             header.session_id = local_session_id;
             Bytes datagram = PacketCodec::encode(header, Bytes{});
-            ::sendto(sock, reinterpret_cast<const char*>(datagram.data()),
-                     static_cast<int>(datagram.size()), 0,
-                     reinterpret_cast<const sockaddr*>(&peer.addr), sizeof(peer.addr));
+            creek_sendto(sock, reinterpret_cast<const char*>(datagram.data()),
+                         static_cast<int>(datagram.size()), 0,
+                         reinterpret_cast<const sockaddr*>(&peer.addr),
+                         static_cast<int>(sizeof(peer.addr)));
             peer.state = LinkState::Closed;
         }
     }

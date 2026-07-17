@@ -61,7 +61,7 @@ struct TightConfig {
     Address bind;
     std::string token;
     std::chrono::milliseconds heartbeat{100};
-    std::chrono::milliseconds dead_timeout{3000};
+    std::chrono::milliseconds dead_timeout{10000};
     std::chrono::milliseconds retransmit_timeout{100};
     std::chrono::milliseconds flush_interval{10};
     std::chrono::milliseconds report_interval{100};
