@@ -100,6 +100,11 @@ std::uint64_t EndpointDirectory::version() const {
     return version_;
 }
 
+std::size_t EndpointDirectory::size() const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return endpoints_.size();
+}
+
 StickyBalancer::StickyBalancer(std::size_t lru_capacity, std::chrono::milliseconds ttl)
     : capacity_(lru_capacity), ttl_(ttl) {}
 

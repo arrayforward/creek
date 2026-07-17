@@ -23,6 +23,7 @@ public:
     std::vector<creek::v1::Endpoint> service(std::string_view name) const;
     creek::v1::DirectorySnapshot snapshot(std::string_view source_id) const;
     std::uint64_t version() const;
+    std::size_t size() const;
 
 private:
     mutable std::mutex mutex_;
