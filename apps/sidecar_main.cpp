@@ -259,5 +259,9 @@ int main(int argc, char** argv) {
         creek::Logger::shutdown();
         usage();
         return 2;
+    } catch (...) {
+        CREEK_LOG_ERROR("sidecar fatal: unknown exception");
+        creek::Logger::shutdown();
+        return 3;
     }
 }
