@@ -4,6 +4,7 @@
 #include <chrono>
 #include <cstdio>
 #include <ctime>
+#include <filesystem>
 #include <mutex>
 #include <string>
 #include <unistd.h>
@@ -47,6 +48,8 @@ void Logger::init(const std::string& log_dir, std::size_t /*max_size*/,
                   std::size_t /*max_files*/, const std::string& /*pattern*/) {
     std::lock_guard<std::mutex> lock(g_log_mutex);
     if (g_initialized.load()) return;
+    std::error_code ec;
+    std::filesystem::create_directories(log_dir, ec);
     int pid = static_cast<int>(::getpid());
     g_log_path = log_dir + "/creek." + std::to_string(pid) + ".log";
     g_log_file = std::fopen(g_log_path.c_str(), "a");

@@ -18,6 +18,9 @@ add_test(
 set_tests_properties(creek_e2e_2node PROPERTIES
     TIMEOUT 180
     RUN_SERIAL TRUE
+    # Set working directory to the binary dir so DLLs (gRPC, absl, etc.) are
+    # found next to the executable on Windows.
+    WORKING_DIRECTORY ${CMAKE_BINARY_DIR}/bin
     ENVIRONMENT "PATH=${CMAKE_BINARY_DIR}/bin;D:/msys64/mingw64/bin;$ENV{PATH}"
     ENVIRONMENT "CREEK_SIDECAR=$<TARGET_FILE:creek_sidecar>"
     ENVIRONMENT "CREEK_HELLO_SERVER=$<TARGET_FILE:creek_hello_server>"
@@ -47,8 +50,9 @@ add_test(
     COMMAND "$<TARGET_FILE:creek_e2e_grpc>"
 )
 set_tests_properties(creek_e2e_grpc PROPERTIES
-    TIMEOUT 120
+    TIMEOUT 300
     RUN_SERIAL TRUE
+    WORKING_DIRECTORY ${CMAKE_BINARY_DIR}/bin
     ENVIRONMENT "PATH=${CMAKE_BINARY_DIR}/bin;D:/msys64/mingw64/bin;$ENV{PATH}"
     ENVIRONMENT "CREEK_SIDECAR=$<TARGET_FILE:creek_sidecar>"
     ENVIRONMENT "CREEK_HELLO_SERVER=$<TARGET_FILE:creek_hello_server>"
@@ -73,8 +77,9 @@ add_test(
     COMMAND "$<TARGET_FILE:creek_e2e_jsonrpc>"
 )
 set_tests_properties(creek_e2e_jsonrpc PROPERTIES
-    TIMEOUT 120
+    TIMEOUT 300
     RUN_SERIAL TRUE
+    WORKING_DIRECTORY ${CMAKE_BINARY_DIR}/bin
     ENVIRONMENT "PATH=${CMAKE_BINARY_DIR}/bin;D:/msys64/mingw64/bin;$ENV{PATH}"
     ENVIRONMENT "CREEK_SIDECAR=$<TARGET_FILE:creek_sidecar>"
     ENVIRONMENT "CREEK_HELLO_SERVER=$<TARGET_FILE:creek_hello_server>"

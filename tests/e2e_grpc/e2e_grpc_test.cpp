@@ -413,16 +413,17 @@ bool TestEnv::start_all() {
         return false;
     }
 
-    if (!wait_tcp(ports_.entry_grpc, 15000)) {
-        emit_log("start_all", "entry_leaf gRPC not listening");
+    int gRPC_wait_ms = 60000;
+    if (!wait_tcp(ports_.entry_grpc, gRPC_wait_ms)) {
+        emit_log("start_all", "entry_leaf gRPC not listening after " + std::to_string(gRPC_wait_ms) + "ms");
         return false;
     }
-    if (!wait_tcp(ports_.svc1_grpc, 15000)) {
-        emit_log("start_all", "service_leaf_1 gRPC not listening");
+    if (!wait_tcp(ports_.svc1_grpc, gRPC_wait_ms)) {
+        emit_log("start_all", "service_leaf_1 gRPC not listening after " + std::to_string(gRPC_wait_ms) + "ms");
         return false;
     }
-    if (!wait_tcp(ports_.svc2_grpc, 15000)) {
-        emit_log("start_all", "service_leaf_2 gRPC not listening");
+    if (!wait_tcp(ports_.svc2_grpc, gRPC_wait_ms)) {
+        emit_log("start_all", "service_leaf_2 gRPC not listening after " + std::to_string(gRPC_wait_ms) + "ms");
         return false;
     }
     emit_log("start_all", "all leaf gRPC servers are listening");

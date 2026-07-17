@@ -81,6 +81,8 @@ public:
     bool start() {
         if (running_.load()) return true;
 
+        CREEK_LOG_INFO(std::string("[runtime] node start id=") + config_.id);
+
         if (config_.redis.port != 0) {
             try {
                 redis_ = std::make_unique<RedisClient>(config_.redis, config_.id);
@@ -571,6 +573,8 @@ public:
 
     bool start() {
         if (running_.load()) return true;
+
+        CREEK_LOG_INFO(std::string("[runtime] leaf start id=") + config_.id);
 
         if (config_.redis.port != 0) {
             try {
