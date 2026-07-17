@@ -1,4 +1,5 @@
 #include "creek/redis.hpp"
+#include "creek/logger.hpp"
 
 #include <gtest/gtest.h>
 
@@ -265,7 +266,7 @@ struct RedisGuard {
             if (!ok && r->str) err.assign(r->str, r->len);
             freeReplyObject(r);
             if (!ok) {
-                std::fprintf(stderr, "Redis AUTH failed: %s\n", err.c_str());
+                CREEK_LOG_ERROR(std::string("Redis AUTH failed: ") + err);
                 disconnect();
                 return false;
             }
@@ -377,7 +378,7 @@ protected:
         std::string output = read_pipe_to_string(pipe);
         int rc = ::_pclose(pipe);
         if (rc != 0) {
-            std::fprintf(stderr, "hello_client failed (rc=%d): %s\n", rc, output.c_str());
+            CREEK_LOG_ERROR(std::string("hello_client failed (rc=") + std::to_string(rc) + "): " + output);
             return false;
         }
         std::istringstream iss(output);

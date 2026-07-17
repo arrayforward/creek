@@ -147,54 +147,8 @@ foreach(CREEK_UNIT_TEST_SOURCE IN LISTS CREEK_UNIT_TEST_SOURCES)
     add_test(NAME "${CREEK_UNIT_TEST_TARGET}" COMMAND "${CREEK_UNIT_TEST_TARGET}")
 endforeach()
 
-add_executable(creek_e2e_2node
-    "${CMAKE_CURRENT_SOURCE_DIR}/tests/e2e_2node_test.cpp"
-    "${CMAKE_CURRENT_SOURCE_DIR}/tests/e2e_2node_main.cpp"
-)
-target_link_libraries(creek_e2e_2node PRIVATE creek_core GTest::gtest_main)
-if(WIN32)
-  set_target_properties(creek_e2e_2node PROPERTIES WIN32_EXECUTABLE OFF)
-endif()
-add_test(
-    NAME creek_e2e_2node
-    COMMAND "$<TARGET_FILE:creek_e2e_2node>"
-)
-set_tests_properties(creek_e2e_2node PROPERTIES
-    TIMEOUT 180
-    RUN_SERIAL TRUE
-    ENVIRONMENT "PATH=${CMAKE_BINARY_DIR}/bin;$ENV{PATH}"
-    ENVIRONMENT "CREEK_SIDECAR=$<TARGET_FILE:creek_sidecar>"
-    ENVIRONMENT "CREEK_HELLO_SERVER=$<TARGET_FILE:creek_hello_server>"
-    ENVIRONMENT "CREEK_HELLO_CLIENT=$<TARGET_FILE:creek_hello_client>"
-    ENVIRONMENT "CREEK_REDIS_HOST=127.0.0.1"
-    ENVIRONMENT "CREEK_REDIS_PORT=6379"
-    ENVIRONMENT "CREEK_REDIS_PASS=creekredis"
-    ENVIRONMENT "CREEK_REDIS_KEY=creek.nodes"
-    ENVIRONMENT "CREEK_E2E_LOG_DIR=D:/vit/creek/tests/e2e-logs"
-    ENVIRONMENT "CREEK_E2E_TOKEN=test-e2e-token"
-)
-
 add_subdirectory(tests)
 
-if(Python3_Interpreter_FOUND)
-    add_test(
-        NAME creek_e2e_grpc
-        COMMAND
-            "${Python3_EXECUTABLE}"
-            "${CMAKE_CURRENT_SOURCE_DIR}/tests/e2e/e2e_grpc.py"
-            --sidecar "$<TARGET_FILE:creek_sidecar>"
-            --hello-server "$<TARGET_FILE:creek_hello_server>"
-            --hello-client "$<TARGET_FILE:creek_hello_client>"
-    )
-    set_tests_properties(creek_e2e_grpc PROPERTIES TIMEOUT 90 RUN_SERIAL TRUE)
-
-    add_test(
-        NAME creek_e2e_jsonrpc
-        COMMAND
-            "${Python3_EXECUTABLE}"
-            "${CMAKE_CURRENT_SOURCE_DIR}/tests/e2e/e2e_jsonrpc.py"
-            --sidecar "$<TARGET_FILE:creek_sidecar>"
-            --hello-server "$<TARGET_FILE:creek_hello_server>"
-    )
-    set_tests_properties(creek_e2e_jsonrpc PROPERTIES TIMEOUT 90 RUN_SERIAL TRUE)
-endif()
+# C++ e2e tests (2-node redis discovery + 5-component gRPC routing).
+# All end-to-end tests are now C++; the Python wrappers were removed.
+add_subdirectory(tests/e2e_grpc)

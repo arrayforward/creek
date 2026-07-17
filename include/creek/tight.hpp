@@ -33,7 +33,8 @@ enum class PacketType : std::uint8_t {
     Bye = 5,
     Data = 6,
     Ack = 7,
-    Parity = 8
+    Parity = 8,
+    Report = 9
 };
 
 struct PacketHeader {
@@ -63,6 +64,7 @@ struct TightConfig {
     std::chrono::milliseconds dead_timeout{3000};
     std::chrono::milliseconds retransmit_timeout{100};
     std::chrono::milliseconds flush_interval{10};
+    std::chrono::milliseconds report_interval{100};
     std::size_t mtu{1200};
     std::size_t queue_limit{4096};
     std::uint64_t initial_bandwidth_bytes{10U * 1024U * 1024U};

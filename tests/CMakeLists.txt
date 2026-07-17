@@ -1,10 +1,7 @@
 add_test(
     NAME creek_redis_discovery_e2e
     COMMAND
-        "powershell.exe" -NoProfile -ExecutionPolicy Bypass -File
-        "${CMAKE_CURRENT_SOURCE_DIR}/../tools/redis_e2e.ps1"
-        -SidecarExe "$<TARGET_FILE:creek_sidecar>"
-        -HelloServerExe "$<TARGET_FILE:creek_hello_server>"
-        -HelloClientExe "$<TARGET_FILE:creek_hello_client>"
+        "D:/msys64/usr/bin/bash.exe" "${CMAKE_CURRENT_SOURCE_DIR}/../tools/redis_e2e.sh"
 )
-set_tests_properties(creek_redis_discovery_e2e PROPERTIES TIMEOUT 180 RUN_SERIAL TRUE)
+set_tests_properties(creek_redis_discovery_e2e PROPERTIES TIMEOUT 180 RUN_SERIAL TRUE
+    ENVIRONMENT "PATH=${CMAKE_BINARY_DIR}/bin;D:/msys64/mingw64/bin;$ENV{PATH}")

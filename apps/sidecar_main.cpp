@@ -1,5 +1,6 @@
 #include "creek/runtime.hpp"
 #include "creek/types.hpp"
+#include "creek/logger.hpp"
 
 #include <chrono>
 #include <csignal>
@@ -244,10 +245,18 @@ int main(int argc, char** argv) {
     }
     std::signal(SIGINT, handle_signal);
     std::signal(SIGTERM, handle_signal);
+
+    creek::Logger::init();
+    CREEK_LOG_INFO(std::string("sidecar starting argc=") + std::to_string(argc));
+
     try {
-        return execute(parse_options(argc, argv));
+        int rc = execute(parse_options(argc, argv));
+        creek::Logger::shutdown();
+        return rc;
     } catch (const std::exception& error) {
+        CREEK_LOG_ERROR(std::string("sidecar fatal: ") + error.what());
         std::cerr << error.what() << '\n';
+        creek::Logger::shutdown();
         usage();
         return 2;
     }

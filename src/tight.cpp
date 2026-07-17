@@ -1,9 +1,11 @@
 #include "creek/tight.hpp"
+#include "creek/blocking_queue.hpp"
 #include "creek/types.hpp"
 
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <cmath>
 #include <chrono>
 #include <condition_variable>
 #include <cstdint>
@@ -14,6 +16,7 @@
 #include <mutex>
 #include <optional>
 #include <random>
+#include <set>
 #include <string>
 #include <thread>
 #include <utility>
@@ -338,6 +341,16 @@ public:
 
     mutable std::mutex peers_mutex;
 
+    // Worker thread for CPU-bound fragment encoding (FEC + RS).
+    // The reactor stays free to process incoming packets.
+    struct Peer; // forward
+    struct EncodeTask {
+        Peer* peer;
+        Bytes payload;
+    };
+     BlockingQueue<EncodeTask> encode_queue{4096};
+    std::thread encode_thread;
+
     struct PendingSend {
         PacketHeader header{};
         Bytes payload;
@@ -366,11 +379,21 @@ public:
         std::chrono::steady_clock::time_point last_recv;
         std::chrono::steady_clock::time_point last_heartbeat_sent;
         std::chrono::steady_clock::time_point last_handshake_sent;
+        std::chrono::steady_clock::time_point last_report_sent;
         std::uint32_t sequence_out{1};
         std::uint32_t highest_recv_seq{};
         std::map<std::uint32_t, PendingSend> pending;
         std::map<std::uint32_t, IncomingMessage> incoming;
         std::map<std::uint32_t, std::chrono::steady_clock::time_point> completed;
+        std::map<std::uint32_t, std::chrono::steady_clock::time_point> missing_seqs;
+        std::set<std::uint32_t> recv_seqs;
+        std::uint32_t next_expected_seq{};
+        bool seq_initialized{false};
+        std::uint32_t sender_rtt_us{};
+        std::uint32_t last_hb_tick{};
+        std::uint64_t delay_samples{};
+        std::uint64_t delay_exceeded{};
+        double delay_entropy{0.0};
         bool reconnect{};
     };
 
@@ -502,6 +525,7 @@ public:
 
         running.store(true);
         reactor_thread = std::thread([this] { run(); });
+        encode_thread = std::thread([this] { encode_loop(); });
         return true;
     }
 
@@ -509,9 +533,13 @@ public:
         if (!running.exchange(false)) {
             return;
         }
+        encode_queue.close();
         send_cv.notify_all();
         if (reactor_thread.joinable()) {
             try { reactor_thread.join(); } catch (...) {}
+        }
+        if (encode_thread.joinable()) {
+            try { encode_thread.join(); } catch (...) {}
         }
         if (sock != kInvalidSocket) {
             close_socket(sock);
@@ -604,8 +632,8 @@ public:
             refill_token_bucket();
             send_handshakes();
             send_heartbeats();
+            send_reports();
             check_offline();
-            retransmit_pending();
             process_send_queue();
         }
     }
@@ -698,21 +726,25 @@ public:
             peer->peer_session_id = header.session_id;
         }
 
-        std::uint32_t ack_to_send = header.sequence;
-        bool need_ack = header.sequence != 0;
+        bool need_ack = false;
+        std::uint32_t ack_to_send = 0;
         if (header.sequence > peer->highest_recv_seq) {
             peer->highest_recv_seq = header.sequence;
         }
 
         switch (header.type) {
-            case PacketType::Handshake:    handle_handshake(peer, header, payload); break;
-            case PacketType::HandshakeAck: handle_handshake_ack(peer, header, payload); break;
-            case PacketType::Online:       handle_online(peer, header, payload); break;
-            case PacketType::Heartbeat:    break;
+            case PacketType::Handshake:    handle_handshake(peer, header, payload);
+                                           need_ack = true; ack_to_send = header.sequence; break;
+            case PacketType::HandshakeAck: handle_handshake_ack(peer, header, payload);
+                                           need_ack = true; ack_to_send = header.sequence; break;
+            case PacketType::Online:       handle_online(peer, header, payload);
+                                           need_ack = true; ack_to_send = header.sequence; break;
+            case PacketType::Heartbeat:    handle_heartbeat(peer, header, payload); break;
             case PacketType::Bye:          handle_bye(peer, header, payload); break;
             case PacketType::Data:         handle_data(peer, header, payload); break;
             case PacketType::Parity:       handle_data(peer, header, payload); break;
             case PacketType::Ack:          handle_ack(peer, header); break;
+            case PacketType::Report:       handle_report(peer, header, payload); break;
         }
 
         if (need_ack) {
@@ -757,6 +789,15 @@ public:
         }
     }
 
+    void handle_heartbeat(Peer* peer, const PacketHeader& header, const Bytes& payload) {
+        if (payload.size() >= 4) {
+            std::uint32_t rtt_be = 0;
+            std::memcpy(&rtt_be, payload.data(), 4);
+            peer->sender_rtt_us = to_be32(rtt_be);
+        }
+        peer->last_hb_tick = header.tick;
+    }
+
     void handle_bye(Peer* peer, const PacketHeader& header, const Bytes& payload) {
         if (peer->state != LinkState::Closed) {
             peer->state = LinkState::Closed;
@@ -765,6 +806,40 @@ public:
     }
 
     void handle_data(Peer* peer, const PacketHeader& header, const Bytes& payload) {
+        std::uint32_t seq = header.sequence;
+        auto now = std::chrono::steady_clock::now();
+        std::uint32_t rtt_threshold = peer->sender_rtt_us > 0 ? peer->sender_rtt_us : 10000;
+
+        if (!peer->seq_initialized) {
+            peer->next_expected_seq = seq + 1;
+            peer->seq_initialized = true;
+        } else if (seq >= peer->next_expected_seq) {
+            for (std::uint32_t g = peer->next_expected_seq; g < seq; ++g) {
+                if (!peer->recv_seqs.count(g)) {
+                    peer->missing_seqs.emplace(g, now);
+                }
+            }
+            peer->recv_seqs.insert(seq);
+            while (peer->recv_seqs.count(peer->next_expected_seq)) {
+                peer->recv_seqs.erase(peer->next_expected_seq);
+                ++peer->next_expected_seq;
+            }
+        } else {
+            auto mit = peer->missing_seqs.find(seq);
+            if (mit != peer->missing_seqs.end()) {
+                auto delay_us = std::chrono::duration_cast<std::chrono::microseconds>(now - mit->second).count();
+                peer->delay_samples++;
+                if (delay_us > static_cast<long long>(rtt_threshold)) {
+                    peer->delay_exceeded++;
+                }
+                peer->missing_seqs.erase(mit);
+            }
+            while (peer->recv_seqs.count(peer->next_expected_seq)) {
+                peer->recv_seqs.erase(peer->next_expected_seq);
+                ++peer->next_expected_seq;
+            }
+        }
+
         if (header.fragment_count == 0) return;
         if (peer->completed.contains(header.message_id)) return;
         std::uint16_t idx = header.fragment_index;
@@ -777,7 +852,7 @@ public:
             in.data_count = header.flags;
             in.fragments.assign(cnt, std::nullopt);
             in.sizes.assign(cnt, 0);
-            in.first_seen = std::chrono::steady_clock::now();
+            in.first_seen = now;
         }
         if (in.total_count != cnt) return;
         if (idx >= in.fragments.size()) return;
@@ -786,7 +861,7 @@ public:
             in.sizes[idx] = header.reserved;
         }
         if (try_assemble(peer, in)) {
-            peer->completed[header.message_id] = std::chrono::steady_clock::now();
+            peer->completed[header.message_id] = now;
             peer->incoming.erase(header.message_id);
         }
     }
@@ -858,7 +933,7 @@ public:
             if (rotated_missing.size() == 1) {
                 if (ReedSolomon::recover_one(rotated, parity_data, rotated_missing[0], width)) {
                     frags[(rotated_missing[0] + p) % data_count] = rotated[rotated_missing[0]];
-                    *in.fragments[(rotated_missing[0] + p) % data_count] = rotated[rotated_missing[0]];
+                    in.fragments[(rotated_missing[0] + p) % data_count] = rotated[rotated_missing[0]];
                     in.sizes[(rotated_missing[0] + p) % data_count] = in.sizes[data_count + p];
                     missing_indices.clear();
                     break;
@@ -884,6 +959,66 @@ public:
         if (rtt.count() < 0) rtt = std::chrono::microseconds(0);
         bandwidth.on_ack(it->second.bytes, rtt);
         peer->pending.erase(it);
+    }
+
+    void handle_report(Peer* peer, const PacketHeader& header, const Bytes& payload) {
+        if (payload.size() < 12) return;
+        std::uint32_t ack_seq_be = 0;
+        std::uint16_t delay_ratio_be = 0;
+        std::uint16_t lost_count_be = 0;
+        std::uint32_t hb_tick_be = 0;
+        std::memcpy(&ack_seq_be, payload.data(), 4);
+        std::memcpy(&delay_ratio_be, payload.data() + 4, 2);
+        std::memcpy(&lost_count_be, payload.data() + 6, 2);
+        std::memcpy(&hb_tick_be, payload.data() + 8, 4);
+        std::uint32_t ack_seq = to_be32(ack_seq_be);
+        std::uint16_t delay_ratio = to_be16(delay_ratio_be);
+        std::uint16_t lost_count = to_be16(lost_count_be);
+        std::uint32_t hb_tick = to_be32(hb_tick_be);
+        std::size_t expected = 12U + static_cast<std::size_t>(lost_count) * 4U;
+        if (payload.size() < expected) return;
+
+        if (hb_tick != 0) {
+            std::uint32_t now_tick = static_cast<std::uint32_t>(unix_millis() & 0xFFFFFFFFULL);
+            std::uint32_t rtt_tick = (now_tick >= hb_tick) ? (now_tick - hb_tick) : 0;
+            auto rtt_us = std::chrono::microseconds(static_cast<long long>(rtt_tick) * 1000);
+            bandwidth.on_ack(64, rtt_us);
+        }
+
+        double p = static_cast<double>(delay_ratio) / 10000.0;
+        if (p <= 0.0 || p >= 1.0) {
+            peer->delay_entropy = 0.0;
+        } else {
+            double h = -p * std::log2(p) - (1.0 - p) * std::log2(1.0 - p);
+            peer->delay_entropy = h;
+        }
+
+        std::set<std::uint32_t> lost_seqs;
+        for (std::uint16_t i = 0; i < lost_count; ++i) {
+            std::uint32_t lost_be = 0;
+            std::memcpy(&lost_be, payload.data() + 12 + i * 4, 4);
+            lost_seqs.insert(to_be32(lost_be));
+        }
+
+        for (auto it = peer->pending.begin(); it != peer->pending.end();) {
+            if (it->first <= ack_seq && !lost_seqs.count(it->first)) {
+                it = peer->pending.erase(it);
+            } else {
+                ++it;
+            }
+        }
+
+        auto now = std::chrono::steady_clock::now();
+        for (auto seq : lost_seqs) {
+            auto it = peer->pending.find(seq);
+            if (it != peer->pending.end()) {
+                if (it->second.retries >= 10) continue;
+                Bytes datagram = PacketCodec::encode(it->second.header, it->second.payload);
+                send_raw(peer, datagram);
+                it->second.last_send = now;
+                ++it->second.retries;
+            }
+        }
     }
 
     void send_control(Peer* peer, PacketType type, const Bytes& payload, bool ackable) {
@@ -944,9 +1079,10 @@ public:
         header.version = kVersion;
         header.type = (idx + 1 == cnt) ? PacketType::Parity : PacketType::Data;
         header.flags = data_cnt;
+        bool is_data = (header.type == PacketType::Data);
         header.client_id = local_client_id;
         header.session_id = local_session_id;
-        if (ackable) {
+        if (ackable && is_data) {
             header.sequence = peer->sequence_out++;
         }
         header.message_id = msg_id;
@@ -957,7 +1093,7 @@ public:
         header.tick = static_cast<std::uint32_t>(unix_millis() & 0xFFFFFFFFULL);
         Bytes datagram = PacketCodec::encode(header, payload);
         send_raw(peer, datagram);
-        if (ackable) {
+        if (ackable && is_data) {
             auto& ps = peer->pending[header.sequence];
             ps.header = header;
             ps.payload = payload;
@@ -1003,8 +1139,75 @@ public:
             auto& peer = kv.second;
             if (peer.state != LinkState::Established && peer.state != LinkState::Online) continue;
             if (now - peer.last_heartbeat_sent < config.heartbeat) continue;
-            send_control(&peer, PacketType::Heartbeat, Bytes{}, true);
+            Bytes hb_payload(4);
+            std::uint32_t rtt_us = static_cast<std::uint32_t>(
+                std::chrono::duration_cast<std::chrono::microseconds>(bandwidth.rtt()).count());
+            std::uint32_t rtt_be = to_be32(rtt_us);
+            std::memcpy(hb_payload.data(), &rtt_be, 4);
+            send_control(&peer, PacketType::Heartbeat, hb_payload, false);
             peer.last_heartbeat_sent = now;
+        }
+    }
+
+    void send_reports() {
+        std::lock_guard<std::mutex> lock(peers_mutex);
+        auto now = std::chrono::steady_clock::now();
+        for (auto& kv : peers) {
+            auto& peer = kv.second;
+            if (peer.state != LinkState::Established && peer.state != LinkState::Online) continue;
+            if (now - peer.last_report_sent < config.report_interval) continue;
+            std::uint32_t rtt_threshold = peer.sender_rtt_us > 0 ? peer.sender_rtt_us : 10000;
+            std::uint32_t loss_threshold = rtt_threshold * 7 / 2;
+            if (rtt_threshold < 10000) loss_threshold = 100000;
+
+            std::vector<std::uint32_t> lost_seqs;
+            for (auto mit = peer.missing_seqs.begin(); mit != peer.missing_seqs.end();) {
+                auto elapsed_us = std::chrono::duration_cast<std::chrono::microseconds>(now - mit->second).count();
+                if (elapsed_us > static_cast<long long>(loss_threshold)) {
+                    lost_seqs.push_back(mit->first);
+                    mit = peer.missing_seqs.erase(mit);
+                } else {
+                    ++mit;
+                }
+            }
+
+            double delay_ratio = 0.0;
+            if (peer.delay_samples > 0) {
+                delay_ratio = static_cast<double>(peer.delay_exceeded) / static_cast<double>(peer.delay_samples);
+            }
+            std::uint16_t ratio_val = static_cast<std::uint16_t>(delay_ratio * 10000.0);
+            std::uint32_t ack_seq = peer.seq_initialized ? (peer.next_expected_seq > 0 ? peer.next_expected_seq - 1 : 0) : 0;
+
+            std::uint16_t lost_count = static_cast<std::uint16_t>(lost_seqs.size());
+            if (lost_count > 256) lost_count = 256;
+            Bytes payload(12 + lost_count * 4);
+            std::uint32_t ack_seq_be = to_be32(ack_seq);
+            std::uint16_t ratio_be = to_be16(ratio_val);
+            std::uint16_t lost_be = to_be16(lost_count);
+            std::uint32_t hb_tick_be = to_be32(peer.last_hb_tick);
+            std::memcpy(payload.data(), &ack_seq_be, 4);
+            std::memcpy(payload.data() + 4, &ratio_be, 2);
+            std::memcpy(payload.data() + 6, &lost_be, 2);
+            std::memcpy(payload.data() + 8, &hb_tick_be, 4);
+            for (std::uint16_t i = 0; i < lost_count; ++i) {
+                std::uint32_t seq_be = to_be32(lost_seqs[i]);
+                std::memcpy(payload.data() + 12 + i * 4, &seq_be, 4);
+            }
+
+            PacketHeader rpt{};
+            rpt.magic = kMagic;
+            rpt.version = kVersion;
+            rpt.type = PacketType::Report;
+            rpt.client_id = local_client_id;
+            rpt.session_id = local_session_id;
+            rpt.payload_size = static_cast<std::uint16_t>(payload.size());
+            rpt.tick = static_cast<std::uint32_t>(unix_millis() & 0xFFFFFFFFULL);
+            Bytes datagram = PacketCodec::encode(rpt, payload);
+            send_raw(&peer, datagram);
+
+            peer.delay_samples = 0;
+            peer.delay_exceeded = 0;
+            peer.last_report_sent = now;
         }
     }
 
@@ -1041,35 +1244,6 @@ public:
         }
     }
 
-    void retransmit_pending() {
-        std::lock_guard<std::mutex> lock(peers_mutex);
-        auto now = std::chrono::steady_clock::now();
-        for (auto& kv : peers) {
-            auto& peer = kv.second;
-            bool exhausted = false;
-            for (auto& kv2 : peer.pending) {
-                if (now - kv2.second.last_send < config.retransmit_timeout) continue;
-                if (kv2.second.retries >= 10) {
-                    exhausted = true;
-                    break;
-                }
-                Bytes datagram = PacketCodec::encode(kv2.second.header, kv2.second.payload);
-                send_raw(&peer, datagram);
-                kv2.second.last_send = now;
-                ++kv2.second.retries;
-            }
-            if (!exhausted) continue;
-            peer.pending.clear();
-            peer.state = LinkState::Closed;
-            fire_peer_event(&peer, LinkState::Closed);
-            if (peer.reconnect) {
-                peer.state = LinkState::Handshake;
-                peer.last_handshake_sent = now - config.retransmit_timeout;
-                peer.last_recv = now;
-            }
-        }
-    }
-
     void process_send_queue() {
         std::map<int, std::deque<std::pair<std::string, Bytes>>> local;
         {
@@ -1081,39 +1255,75 @@ public:
             while (!queue.empty()) {
                 auto item = std::move(queue.front());
                 queue.pop_front();
-                std::lock_guard<std::mutex> lock(peers_mutex);
-                auto pit = peers.find(item.first);
-                if (pit == peers.end()) {
-                    pit = std::find_if(peers.begin(), peers.end(), [&](const auto& entry) {
-                        return entry.second.id == item.first;
-                    });
-                }
-                if (pit == peers.end()) continue;
-                auto& peer = pit->second;
-                if (peer.state != LinkState::Online) {
-                    if (peer.state != LinkState::Closed) {
-                        std::lock_guard<std::mutex> lk(send_mutex);
-                        if ([&]() {
+
+                std::string peer_id = item.first;
+                Bytes payload = std::move(item.second);
+                auto payload_ptr = std::make_shared<Bytes>(std::move(payload));
+
+                {
+                    std::lock_guard<std::mutex> lock(peers_mutex);
+                    auto pit = peers.find(peer_id);
+                    if (pit == peers.end()) {
+                        pit = std::find_if(peers.begin(), peers.end(), [&](const auto& entry) {
+                            return entry.second.id == peer_id;
+                        });
+                    }
+                    if (pit == peers.end()) continue;
+                    auto& peer = pit->second;
+                    if (peer.state != LinkState::Online) {
+                        if (peer.state != LinkState::Closed) {
+                            std::lock_guard<std::mutex> lk(send_mutex);
                             std::size_t total = 0;
                             for (const auto& kv : send_queue) total += kv.second.size();
-                            return total;
-                        }() < config.queue_limit) {
-                            send_queue[it->first].push_back(std::move(item));
+                            if (total < config.queue_limit) {
+                                send_queue[it->first].push_back({peer_id, *payload_ptr});
+                            }
+                        }
+                        continue;
+                    }
+
+                    EncodeTask task{&peer, std::move(*payload_ptr)};
+                    if (!encode_queue.try_push(std::move(task))) {
+                        std::lock_guard<std::mutex> lk(send_mutex);
+                        std::size_t total = 0;
+                        for (const auto& kv : send_queue) total += kv.second.size();
+                        if (total < config.queue_limit) {
+                            send_queue[0].push_back({peer_id, *payload_ptr});
                         }
                     }
-                    continue;
                 }
-                fragment_and_send(&peer, std::move(item.second));
             }
         }
     }
 
-    uint16_t compute_parity_count(Peer* peer) {
-        auto rtt_ms = std::chrono::duration_cast<std::chrono::milliseconds>(bandwidth.rtt()).count();
-        if (rtt_ms <= 0) return 1;
-        if (rtt_ms < 5) return 1;
-        if (rtt_ms < 20) return 2;
-        return 2;
+    void encode_loop() {
+        while (running.load(std::memory_order_acquire)) {
+            auto task = encode_queue.take_for(config.flush_interval);
+            if (!task) continue;
+            try {
+                std::lock_guard<std::mutex> lock(peers_mutex);
+                fragment_and_send(task->peer, std::move(task->payload));
+            } catch (...) {}
+        }
+        while (true) {
+            auto task = encode_queue.poll();
+            if (!task) break;
+            try {
+                std::lock_guard<std::mutex> lock(peers_mutex);
+                fragment_and_send(task->peer, std::move(task->payload));
+            } catch (...) {}
+        }
+    }
+
+    static constexpr double kFecSafetyCoefficient = 1.2;
+
+    uint16_t compute_parity_count(Peer* peer, std::size_t data_count) {
+        if (peer->delay_entropy <= 0.0001) return 1;
+        double redundancy = peer->delay_entropy * kFecSafetyCoefficient;
+        std::uint16_t p = static_cast<std::uint16_t>(std::ceil(static_cast<double>(data_count) * redundancy));
+        if (p < 1) p = 1;
+        if (p > 3) p = 3;
+        return p;
     }
 
     void fragment_and_send(Peer* peer, Bytes payload) {
@@ -1145,7 +1355,7 @@ public:
             if (frags[i].size() < width) frags[i].resize(width, 0);
         }
         Bytes parity = ReedSolomon::parity(frags, width);
-        std::uint16_t parity_count = compute_parity_count(peer);
+        std::uint16_t parity_count = compute_parity_count(peer, data_count);
         std::vector<Bytes> parities;
         parities.push_back(parity);
         for (std::uint16_t p = 1; p < parity_count; ++p) {

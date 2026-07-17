@@ -3,6 +3,7 @@
 #include "creek.pb.h"
 #include "creek.grpc.pb.h"
 #include "creek/circuit_breaker.hpp"
+#include "creek/logger.hpp"
 #include "creek/trace_context.hpp"
 #include "creek/wasm_runtime.hpp"
 #include "creek/json_rpc.hpp"
@@ -85,7 +86,7 @@ public:
                 redis_ = std::make_unique<RedisClient>(config_.redis, config_.id);
                 redis_->register_node(format_address(config_.udp_bind));
             } catch (const std::exception& e) {
-                std::fprintf(stderr, "[runtime] redis init failed: %s\n", e.what());
+                CREEK_LOG_ERROR(std::string("[runtime] redis init failed: ") + e.what());
                 redis_.reset();
                 return false;
             }
@@ -106,7 +107,7 @@ public:
             on_peer_event(ev);
         });
         if (!transport_->start()) {
-            std::fprintf(stderr, "[runtime] tight transport start failed\n");
+            CREEK_LOG_ERROR("[runtime] tight transport start failed");
             transport_.reset();
             return false;
         }
@@ -123,7 +124,7 @@ public:
         metrics_store_ = std::make_shared<MetricsStore>(config_.metric_period);
         metrics_server_ = std::make_unique<MetricsHttpServer>(metrics_store_, config_.metrics_bind);
         if (!metrics_server_->start()) {
-            std::fprintf(stderr, "[runtime] metrics http server start failed\n");
+            CREEK_LOG_ERROR("[runtime] metrics http server start failed");
             metrics_server_.reset();
             transport_->stop();
             transport_.reset();
@@ -267,10 +268,9 @@ private:
                                const creek::v1::RoutedRequest& req) {
         const std::string dest_node = req.destination_node();
         const std::string dest_leaf = req.destination_leaf();
-        std::fprintf(stderr, "[creek-node] route_request from=%s dest=(node=%s leaf=%s) ep=%s\n",
-                     from_peer.c_str(), dest_node.c_str(), dest_leaf.c_str(),
-                     req.endpoint_id().c_str());
-        std::fflush(stderr);
+        CREEK_LOG_INFO(std::string("[creek-node] route_request from=") + from_peer
+                        + " dest=(node=" + dest_node + " leaf=" + dest_leaf
+                        + ") ep=" + req.endpoint_id());
         if (dest_node.empty() || dest_node == config_.id) {
             auto leaf_it = leaves_.find(dest_leaf);
             if (leaf_it == leaves_.end()) {
@@ -772,11 +772,10 @@ public:
     }
 
     void handle_inbound_request(const creek::v1::RoutedRequest& req, std::size_t raw_size) {
-        std::fprintf(stderr, "[creek-leaf] recv_routed rid=%.36s from=(node=%s leaf=%s) dest=(node=%s leaf=%s) ep=%s\n",
-                     req.request_id().c_str(), req.origin_node().c_str(), req.origin_leaf().c_str(),
-                     req.destination_node().c_str(), req.destination_leaf().c_str(),
-                     req.endpoint_id().c_str());
-        std::fflush(stderr);
+        CREEK_LOG_INFO(std::string("[creek-leaf] recv_routed rid=") + req.request_id()
+                        + " from=(node=" + req.origin_node() + " leaf=" + req.origin_leaf()
+                        + ") dest=(node=" + req.destination_node() + " leaf=" + req.destination_leaf()
+                        + ") ep=" + req.endpoint_id());
         if (req.destination_leaf() != config_.id) {
             creek::v1::RoutedResponse resp = make_error_response(req, "wrong_destination_leaf");
             send_response_to_parent(resp);
@@ -812,10 +811,10 @@ public:
         std::string ts = (it_ts != req.metadata().end()) ? it_ts->second : std::string();
         TraceSpan mesh_span = TraceContext::extract_or_create(tp, ts);
         TraceSpan backend_span = TraceContext::create_child(mesh_span);
-        std::fprintf(stderr, "[trace] leaf_backend: trace_id=%.32s span_id=%.16s parent=%.16s ep=%s\n",
-                     backend_span.trace_id.c_str(), backend_span.span_id.c_str(),
-                     backend_span.parent_span_id.c_str(), ep_opt->endpoint_id().c_str());
-        std::fflush(stderr);
+        CREEK_LOG_DEBUG(std::string("[trace] leaf_backend: trace_id=")
+                         + backend_span.trace_id + " span_id=" + backend_span.span_id
+                         + " parent=" + backend_span.parent_span_id
+                         + " ep=" + ep_opt->endpoint_id());
 
         grpc::Status status = stub->SayHello(&ctx, hello_req, &hello_reply);
         auto latency = std::chrono::duration_cast<std::chrono::microseconds>(
@@ -1008,11 +1007,12 @@ public:
                 }
             }
         }
-        std::fprintf(stderr, "[creek-leaf] send_routed rid=%.36s dest_node=%s dest_leaf=%s ep=%s sent=%d\n",
-                     out.request_id().c_str(), out.destination_node().c_str(),
-                     out.destination_leaf().c_str(), out.endpoint_id().c_str(),
-                     sent ? 1 : 0);
-        std::fflush(stderr);
+        CREEK_LOG_DEBUG(std::string("[creek-leaf] send_routed rid=")
+                         + out.request_id()
+                         + " dest_node=" + out.destination_node()
+                         + " dest_leaf=" + out.destination_leaf()
+                         + " ep=" + out.endpoint_id()
+                         + (sent ? " sent=1" : " sent=0"));
         record_metric("leaf_to_node", "RoutedRequest", payload.size(), 0, true, metadata);
 
         std::unique_lock<std::mutex> sl(slot->m);
@@ -1188,8 +1188,7 @@ public:
             if (!tried.insert(ep_opt->endpoint_id()).second) break;
             const creek::v1::Endpoint& ep = *ep_opt;
             if (!breaker_.allow(ep.endpoint_id())) {
-                std::fprintf(stderr, "[creek-leaf] circuit open ep=%s\n", ep.endpoint_id().c_str());
-                std::fflush(stderr);
+                CREEK_LOG_WARN(std::string("[creek-leaf] circuit open ep=") + ep.endpoint_id());
                 last_status = grpc::Status(grpc::StatusCode::UNAVAILABLE, "circuit_open");
                 continue;
             }
@@ -1248,9 +1247,9 @@ public:
         TraceSpan child = TraceContext::create_child(span);
         metadata["traceparent"] = child.traceparent_swapped();
         if (!child.trace_state.empty()) metadata["tracestate"] = child.trace_state;
-        std::fprintf(stderr, "[trace] gRPC entry: trace_id=%.32s span_id=%.16s parent=%.16s\n",
-                     child.trace_id.c_str(), child.span_id.c_str(), child.parent_span_id.c_str());
-        std::fflush(stderr);
+        CREEK_LOG_DEBUG(std::string("[trace] gRPC entry: trace_id=")
+                         + child.trace_id + " span_id=" + child.span_id
+                         + " parent=" + child.parent_span_id);
 
         grpc::Status status = invoke_for_hello(*request, metadata, response);
         return status;
@@ -1283,9 +1282,9 @@ public:
             directory_.upsert_local(ep);
             local_endpoints_[ep.endpoint_id()] = LocalEndpoint{ep, SteadyClock::now()};
         }
-        std::fprintf(stderr, "[creek-leaf] register ep=%s svc=%s target=%s\n",
-                     ep.endpoint_id().c_str(), ep.service().c_str(), ep.target().c_str());
-        std::fflush(stderr);
+        CREEK_LOG_DEBUG(std::string("[creek-leaf] register ep=")
+                         + ep.endpoint_id() + " svc=" + ep.service()
+                         + " target=" + ep.target());
         send_snapshot_to_parent();
         response->set_accepted(true);
         return grpc::Status::OK;

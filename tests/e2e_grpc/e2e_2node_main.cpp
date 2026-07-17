@@ -1,4 +1,5 @@
 #include "e2e_2node_test.hpp"
+#include "creek/logger.hpp"
 
 #include <gtest/gtest.h>
 
@@ -33,12 +34,15 @@ int main(int argc, char** argv) {
     setvbuf(stdout, nullptr, _IONBF, 0);
     setvbuf(stderr, nullptr, _IONBF, 0);
     AddVectoredExceptionHandler(1, seh_handler);
+
+    creek::Logger::init("D:/vit/creek/tests/e2e-logs");
     auto* p = std::fopen("D:\\vit\\creek\\tests\\e2e-probe.log", "w");
     if (p) { std::fprintf(p, "start\n"); std::fclose(p); }
     std::fprintf(stdout, "PRE-GTEST\n"); std::fflush(stdout);
     ::testing::InitGoogleTest(&argc, argv);
     int r = RUN_ALL_TESTS();
     std::fprintf(stdout, "DONE rc=%d\n", r); std::fflush(stdout);
+    creek::Logger::shutdown();
     return r;
 }
 
