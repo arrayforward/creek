@@ -1,6 +1,7 @@
 #include "creek/runtime.hpp"
 #include "creek/types.hpp"
 #include "creek/logger.hpp"
+#include "creek/crash_handler.hpp"
 
 #include <chrono>
 #include <csignal>
@@ -246,6 +247,7 @@ int main(int argc, char** argv) {
     std::signal(SIGINT, handle_signal);
     std::signal(SIGTERM, handle_signal);
 
+    creek::install_crash_handler("logs");
     creek::Logger::init();
     CREEK_LOG_INFO(std::string("sidecar starting argc=") + std::to_string(argc));
 

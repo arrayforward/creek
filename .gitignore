@@ -13,6 +13,7 @@ tests/e2e.stdout
 tests/integration/out.log
 sources.txt
 a.exe
+skills/
 *.exe
 *.dll
 *.o

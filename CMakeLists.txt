@@ -94,7 +94,7 @@ add_library(creek_proto STATIC
 target_include_directories(creek_proto PUBLIC "${CREEK_GENERATED_DIR}")
 target_link_libraries(creek_proto PUBLIC protobuf::libprotobuf gRPC::grpc++ gRPC::grpc++_reflection)
 
-file(GLOB CREEK_CORE_SOURCES CONFIGURE_DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/src/*.cpp")
+file(GLOB_RECURSE CREEK_CORE_SOURCES CONFIGURE_DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/src/*.cpp" "${CMAKE_CURRENT_SOURCE_DIR}/src/framework/*.cpp")
 add_library(creek_core STATIC ${CREEK_CORE_SOURCES})
 target_include_directories(creek_core PUBLIC "${CMAKE_CURRENT_SOURCE_DIR}/include")
 target_link_libraries(creek_core
@@ -135,8 +135,8 @@ file(GLOB CREEK_UNIT_TEST_SOURCES CONFIGURE_DEPENDS
 )
 list(FILTER CREEK_UNIT_TEST_SOURCES EXCLUDE REGEX ".*/e2e_.*\\.cpp$")
 list(LENGTH CREEK_UNIT_TEST_SOURCES CREEK_UNIT_TEST_COUNT)
-if(NOT CREEK_UNIT_TEST_COUNT EQUAL 5)
-    message(FATAL_ERROR "Expected exactly five unit test source files, found ${CREEK_UNIT_TEST_COUNT}")
+if(NOT CREEK_UNIT_TEST_COUNT EQUAL 6)
+    message(FATAL_ERROR "Expected exactly six unit test source files, found ${CREEK_UNIT_TEST_COUNT}")
 endif()
 foreach(CREEK_UNIT_TEST_SOURCE IN LISTS CREEK_UNIT_TEST_SOURCES)
     get_filename_component(CREEK_UNIT_TEST_NAME "${CREEK_UNIT_TEST_SOURCE}" NAME_WE)

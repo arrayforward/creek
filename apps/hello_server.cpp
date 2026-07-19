@@ -1,5 +1,6 @@
 #include "creek.grpc.pb.h"
 #include "creek/types.hpp"
+#include "creek/crash_handler.hpp"
 
 #include <grpcpp/grpcpp.h>
 
@@ -168,6 +169,7 @@ int main(int argc, char** argv) {
     }
     std::signal(SIGINT, handle_signal);
     std::signal(SIGTERM, handle_signal);
+    creek::install_crash_handler("logs");
     try {
         return execute(parse_options(argc, argv));
     } catch (const std::exception& error) {

@@ -6,6 +6,11 @@
 #include <optional>
 #include <queue>
 
+// Note: This queue already uses value semantics (moves items in/out).
+// For CSP-style deep-copy channels with buffer management, use
+// creek::framework::CopyChannel from framework/channel.hpp.
+// This class is kept for backward compatibility with existing code.
+
 namespace creek {
 
 template <typename T>
