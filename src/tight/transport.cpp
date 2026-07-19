@@ -257,7 +257,7 @@ public:
         }
 
         m_running.store(true);
-        m_reactor_thread = std::thread([this] { run(); });
+        m_reactor_thread = std::thread([this] { reactor_loop(); });
         m_receiver_thread = std::thread([this] { receiver_loop(); });
         m_encode_thread = std::thread([this] { encode_loop(); });
         m_sender_thread = std::thread([this] { sender_loop(); });
@@ -346,8 +346,7 @@ public:
         return out;
     }
 
-    void run() {
-        // Reactor runs business logic only; IO is done by receiver/sender threads.
+    void reactor_loop() {
         auto next_tick = std::chrono::steady_clock::now();
         while (m_running.load(std::memory_order_acquire)) {
             send_handshakes();
@@ -355,13 +354,11 @@ public:
             send_reports();
             check_offline();
             process_send_queue();
-            // Sleep until the next tick to avoid spinning.
             next_tick += m_config.flush_interval;
             auto now = std::chrono::steady_clock::now();
             if (now < next_tick) {
                 std::this_thread::sleep_for(next_tick - now);
             } else {
-                // We're behind schedule; yield to let other threads run.
                 std::this_thread::yield();
             }
         }

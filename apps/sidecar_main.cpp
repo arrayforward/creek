@@ -2,6 +2,7 @@
 #include "creek/types.hpp"
 #include "creek/logger.hpp"
 #include "creek/crash_handler.hpp"
+#include "creek/framework/framework.hpp"
 
 #include <chrono>
 #include <csignal>
@@ -177,14 +178,20 @@ bool has_redis_options(const Options& options) {
 
 template <typename Runtime>
 int run(Runtime& runtime) {
+    creek::framework::ReactorConfig reactor_cfg;
+    creek::framework::Framework framework(reactor_cfg);
+    runtime.set_framework(&framework);
+    framework.start();
     if (!runtime.start()) {
         std::cerr << "failed to start sidecar\n";
+        framework.stop();
         return 1;
     }
     while (!stopped) {
         std::this_thread::sleep_for(std::chrono::milliseconds(100));
     }
     runtime.stop();
+    framework.stop();
     return 0;
 }
 

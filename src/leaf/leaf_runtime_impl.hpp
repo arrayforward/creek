@@ -112,10 +112,7 @@ public:
     grpc::Status handle_unload_wasm(::grpc::ServerContext* context,
                                     const ::creek::v1::UnloadWasmRequest* request,
                                     ::creek::v1::UnloadWasmReply* response);
-    void m_redissync_loop();
     void send_snapshot_to_parent();
-    void heartbeat_loop();
-    void sync_loop();
     void do_heartbeat_work();
     void do_sync_work();
     void do_redis_sync_work();
@@ -148,9 +145,6 @@ public:
     std::unique_ptr<LeafControlService> m_leaf_control_service;
     std::unique_ptr<AdminService> m_admin_service;
     std::thread m_grpc_wait_thread;
-    std::thread m_heartbeat_thread;
-    std::thread m_sync_thread;
-    std::thread m_redissync_thread_;
     // Worker pool that executes inbound routed requests (backend gRPC calls)
     // off the tight transport's single receiver thread.
     std::vector<std::thread> m_worker_threads;

@@ -72,41 +72,29 @@ bool NodeRuntime::Impl::start() {
     }
 
     m_running.store(true);
-    if (m_framework) {
-        auto interval = m_config.sync_interval;
-        if (interval.count() <= 0) interval = std::chrono::milliseconds(15000);
-        m_sync_task_id = m_framework->reactor().schedule_periodic(
-            "node_sync", [this] { do_sync_work(); }, interval,
+    auto interval = m_config.sync_interval;
+    if (interval.count() <= 0) interval = std::chrono::milliseconds(15000);
+    m_sync_task_id = m_framework->reactor().schedule_periodic(
+        "node_sync", [this] { do_sync_work(); }, interval,
+        framework::TaskPriority::Normal, false);
+    if (m_redis) {
+        m_redis_sync_task_id = m_framework->reactor().schedule_periodic(
+            "node_redis_sync", [this] { do_redis_sync_work(); },
+            std::chrono::milliseconds(1000),
             framework::TaskPriority::Normal, false);
-        if (m_redis) {
-            m_redis_sync_task_id = m_framework->reactor().schedule_periodic(
-                "node_redis_sync", [this] { do_redis_sync_work(); },
-                std::chrono::milliseconds(1000),
-                framework::TaskPriority::Normal, false);
-        }
-    } else {
-        m_sync_thread = std::thread([this] { sync_loop(); });
-        if (m_redis) {
-            m_redissync_thread_ = std::thread([this] { m_redissync_loop(); });
-        }
     }
     return true;
 }
 
 void NodeRuntime::Impl::stop() {
     if (!m_running.exchange(false)) return;
-    if (m_framework) {
-        if (m_sync_task_id != 0) {
-            m_framework->reactor().cancel_periodic(m_sync_task_id);
-            m_sync_task_id = 0;
-        }
-        if (m_redis_sync_task_id != 0) {
-            m_framework->reactor().cancel_periodic(m_redis_sync_task_id);
-            m_redis_sync_task_id = 0;
-        }
-    } else {
-        if (m_sync_thread.joinable()) m_sync_thread.join();
-        if (m_redissync_thread_.joinable()) m_redissync_thread_.join();
+    if (m_sync_task_id != 0) {
+        m_framework->reactor().cancel_periodic(m_sync_task_id);
+        m_sync_task_id = 0;
+    }
+    if (m_redis_sync_task_id != 0) {
+        m_framework->reactor().cancel_periodic(m_redis_sync_task_id);
+        m_redis_sync_task_id = 0;
     }
     if (m_metrics_server) m_metrics_server->stop();
     m_metrics_server.reset();
@@ -118,7 +106,14 @@ void NodeRuntime::Impl::stop() {
     m_redis.reset();
 }
 
-void NodeRuntime::Impl::set_framework(framework::Framework* fw) { m_framework = fw; }
+void NodeRuntime::Impl::set_framework(framework::Framework* fw) {
+    m_framework = fw;
+    if (fw) {
+        fw->set_batch_processor([this](const std::vector<framework::Message>& batch) {
+            return process_batch(batch);
+        });
+    }
+}
 
 framework::ChangeSet NodeRuntime::Impl::process_batch(const std::vector<framework::Message>& batch) {
     framework::ChangeSet cs;
@@ -146,13 +141,6 @@ framework::ChangeSet NodeRuntime::Impl::process_batch(const std::vector<framewor
 }
 
 void NodeRuntime::Impl::on_peer_event(const PeerEvent& ev) {
-    if (m_framework) {
-        framework::Message msg(framework::MessageKind::PeerEvent, ev.id);
-        msg.payload.resize(sizeof(PeerEvent));
-        std::memcpy(msg.payload.data(), &ev, sizeof(PeerEvent));
-        m_framework->input_channel().send(std::move(msg));
-        return;
-    }
     std::lock_guard<std::mutex> lk(m_mutex);
     CREEK_LOG_INFO(std::string("[runtime] on_peer_event id=") + ev.id + " state=" + std::to_string((int)ev.state));
     if (ev.role == LinkRole::Leaf) {
@@ -176,12 +164,6 @@ void NodeRuntime::Impl::on_peer_event(const PeerEvent& ev) {
 }
 
 void NodeRuntime::Impl::on_message(const std::string& peer_id, Bytes payload) {
-    if (m_framework) {
-        framework::Message msg(framework::MessageKind::UdpDatagram, peer_id);
-        msg.payload = std::move(payload);
-        m_framework->input_channel().send(std::move(msg));
-        return;
-    }
     CREEK_LOG_DEBUG(std::string("[runtime] leaf on_message from=") + peer_id + " bytes=" + std::to_string(payload.size()));
     creek::v1::WireMessage msg;
     if (!parse_wire(payload, msg)) return;
@@ -417,68 +399,6 @@ void NodeRuntime::Impl::revoke_leaf_locked(const std::string& leaf_id) {
         broadcast_snapshot_locked();
     } else {
         m_leaf_endpoints.erase(leaf_id);
-    }
-}
-
-void NodeRuntime::Impl::m_redissync_loop() {
-    while (m_running.load()) {
-        if (m_redis) {
-            try {
-                auto nodes = m_redis->fetch_nodes();
-                {
-                    std::lock_guard<std::mutex> lk(m_mutex);
-                    for (const auto& [node_id, addr_str] : nodes) {
-                        if (node_id == m_config.id) continue;
-                        if (m_known_node_peers.count(node_id) == 0) {
-                            auto addr = parse_address(addr_str);
-                            if (addr) {
-                                m_known_node_peers.insert(node_id);
-                                m_transport->connect({node_id, *addr});
-                            }
-                        }
-                    }
-                }
-                for (const auto& [node_id, _] : nodes) {
-                    if (node_id == m_config.id) continue;
-                    auto leaves = m_redis->fetch_leaves_for_node(node_id);
-                    for (const auto& [leaf_id, leaf_addr] : leaves) {
-                        std::lock_guard<std::mutex> lk(m_mutex);
-                        if (m_leaves.count(leaf_id) == 0) {
-                            auto addr = parse_address(leaf_addr);
-                            if (addr) {
-                                m_leaves[leaf_id] = SteadyClock::now();
-                                m_transport->connect({leaf_id, *addr});
-                            }
-                        }
-                    }
-                }
-            } catch (...) {}
-        }
-        for (int i = 0; i < 10 && m_running.load(); ++i) {
-            std::this_thread::sleep_for(std::chrono::milliseconds(100));
-        }
-    }
-}
-
-void NodeRuntime::Impl::sync_loop() {
-    auto interval = m_config.sync_interval;
-    if (interval.count() <= 0) interval = std::chrono::milliseconds(15000);
-    auto next = SteadyClock::now() + interval;
-    while (m_running.load()) {
-        auto now = SteadyClock::now();
-        if (now < next) {
-            auto sleep_for = std::min<std::chrono::milliseconds>(
-                std::chrono::duration_cast<std::chrono::milliseconds>(next - now),
-                std::chrono::milliseconds(500));
-            if (sleep_for.count() <= 0) sleep_for = std::chrono::milliseconds(10);
-            std::this_thread::sleep_for(sleep_for);
-            continue;
-        }
-        next = now + interval;
-        {
-            std::lock_guard<std::mutex> lk(m_mutex);
-            broadcast_snapshot_locked();
-        }
     }
 }
 

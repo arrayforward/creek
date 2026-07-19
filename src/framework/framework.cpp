@@ -14,10 +14,6 @@ Framework::Framework(ReactorConfig reactor_cfg, TimeSource* time_source)
     , m_stage4(std::make_unique<Stage4Executor>(&m_new_message_channel))
 {
     m_input_channel = &m_input_buffer;
-
-    m_reactor.schedule_timer_in(
-        Task("heartbeat_tick", [this] { on_heartbeat_timer(); }, TaskPriority::High, false),
-        reactor_cfg.heartbeat_interval);
 }
 
 Framework::~Framework()
@@ -33,6 +29,9 @@ void Framework::start()
     m_running.store(true, std::memory_order_release);
     m_stage4->start(2);
     m_reactor.start();
+    m_reactor.schedule_timer_in(
+        Task("heartbeat_tick", [this] { on_heartbeat_timer(); }, TaskPriority::High, false),
+        std::chrono::milliseconds(20));
 }
 
 void Framework::stop()

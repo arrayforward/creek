@@ -170,12 +170,6 @@ bool LeafRuntime::Impl::start() {
                 std::chrono::milliseconds(1000),
                 framework::TaskPriority::Normal, false);
         }
-    } else {
-        m_heartbeat_thread = std::thread([this] { heartbeat_loop(); });
-        m_sync_thread = std::thread([this] { sync_loop(); });
-        if (m_redis) {
-            m_redissync_thread_ = std::thread([this] { m_redissync_loop(); });
-        }
     }
     return true;
 }
@@ -204,10 +198,6 @@ void LeafRuntime::Impl::stop() {
             m_framework->reactor().cancel_periodic(m_redis_sync_task_id);
             m_redis_sync_task_id = 0;
         }
-    } else {
-        if (m_heartbeat_thread.joinable()) m_heartbeat_thread.join();
-        if (m_sync_thread.joinable()) m_sync_thread.join();
-        if (m_redissync_thread_.joinable()) m_redissync_thread_.join();
     }
     if (m_json_rpc_server) m_json_rpc_server->stop();
     m_json_rpc_server.reset();
@@ -233,12 +223,6 @@ void LeafRuntime::Impl::stop() {
 }
 
 void LeafRuntime::Impl::on_message(const std::string& peer_id, Bytes payload) {
-    if (m_framework) {
-        framework::Message msg(framework::MessageKind::UdpDatagram, peer_id);
-        msg.payload = std::move(payload);
-        m_framework->input_channel().send(std::move(msg));
-        return;
-    }
     {
         std::lock_guard<std::mutex> lk(m_mutex);
         if (!m_parent_ids.count(peer_id)) return;
@@ -256,13 +240,6 @@ void LeafRuntime::Impl::on_message(const std::string& peer_id, Bytes payload) {
 }
 
 void LeafRuntime::Impl::on_peer_event(const PeerEvent& ev) {
-    if (m_framework) {
-        framework::Message msg(framework::MessageKind::PeerEvent, ev.id);
-        msg.payload.resize(sizeof(PeerEvent));
-        std::memcpy(msg.payload.data(), &ev, sizeof(PeerEvent));
-        m_framework->input_channel().send(std::move(msg));
-        return;
-    }
     std::lock_guard<std::mutex> lk(m_mutex);
     CREEK_LOG_INFO(std::string("[runtime] leaf on_peer_event id=") + ev.id + " state=" + std::to_string((int)ev.state) +
                    " in_parents=" + std::to_string(m_parent_ids.count(ev.id)));
@@ -988,49 +965,6 @@ grpc::Status LeafRuntime::Impl::handle_unload_wasm(::grpc::ServerContext* contex
     return grpc::Status::OK;
 }
 
-void LeafRuntime::Impl::m_redissync_loop() {
-    while (m_running.load()) {
-        try {
-            std::unordered_map<std::string, std::string> nodes = m_redis->fetch_nodes();
-            std::unordered_map<std::string, std::string> all_leaves;
-            for (const auto& parent : m_config.parents) {
-                if (parent.id.empty()) continue;
-                auto leaves = m_redis->fetch_leaves_for_node(parent.id);
-                for (const auto& entry : leaves) {
-                    all_leaves[entry.first] = entry.second;
-                }
-            }
-            for (const auto& [node_id, _] : nodes) {
-                auto per_node = m_redis->fetch_leaves_for_node(node_id);
-                for (const auto& entry : per_node) {
-                    all_leaves[entry.first] = entry.second;
-                }
-            }
-            {
-                std::lock_guard<std::mutex> lk(m_mutex);
-                for (const auto& [node_id, addr] : nodes) {
-                    if (node_id == m_config.id) continue;
-                    if (m_peer_targets.count(node_id) == 0) {
-                        m_transport->connect({node_id, parse_address(addr).value()});
-                    }
-                    m_peer_targets[node_id] = addr;
-                }
-                for (const auto& [leaf_id, addr] : all_leaves) {
-                    if (leaf_id == m_config.id) continue;
-                    if (m_known_leaves.count(leaf_id) == 0) {
-                        auto parsed = parse_address(addr);
-                        if (parsed) m_known_leaves[leaf_id] = *parsed;
-                    }
-                }
-            }
-        } catch (...) {
-        }
-        for (int i = 0; i < 10 && m_running.load(); ++i) {
-            std::this_thread::sleep_for(std::chrono::milliseconds(100));
-        }
-    }
-}
-
 void LeafRuntime::Impl::send_snapshot_to_parent() {
     creek::v1::DirectorySnapshot snap;
     snap.set_source_id(m_config.id);
@@ -1051,74 +985,6 @@ void LeafRuntime::Impl::send_snapshot_to_parent() {
         }
     }
     record_metric("leaf_to_node", "DirectorySnapshot", payload.size(), 0, true);
-}
-
-void LeafRuntime::Impl::heartbeat_loop() {
-    auto next = SteadyClock::now() + std::chrono::seconds(1);
-    while (m_running.load()) {
-        auto now = SteadyClock::now();
-        if (now < next) {
-            auto sleep_for = std::min<std::chrono::milliseconds>(
-                std::chrono::duration_cast<std::chrono::milliseconds>(next - now),
-                std::chrono::milliseconds(200));
-            if (sleep_for.count() <= 0) sleep_for = std::chrono::milliseconds(10);
-            std::this_thread::sleep_for(sleep_for);
-            continue;
-        }
-        next = now + std::chrono::seconds(1);
-        std::vector<creek::v1::Endpoint> dead;
-        {
-            std::lock_guard<std::mutex> lk(m_mutex);
-            for (auto& kv : m_local_endpoints) {
-                auto age = std::chrono::duration_cast<std::chrono::milliseconds>(
-                    now - kv.second.last_heartbeat).count();
-                if (age >= 3000 && kv.second.endpoint.alive()) {
-                    kv.second.endpoint.set_alive(false);
-                    kv.second.endpoint.set_version(++m_version_counter);
-                    kv.second.endpoint.set_updated_ms(unix_millis());
-                    dead.push_back(kv.second.endpoint);
-                }
-            }
-            for (auto& ep : dead) {
-                m_directory.upsert_local(ep);
-            }
-        }
-        if (!dead.empty()) {
-            send_snapshot_to_parent();
-        }
-    }
-}
-
-void LeafRuntime::Impl::sync_loop() {
-    auto interval = m_config.sync_interval;
-    if (interval.count() <= 0) interval = std::chrono::milliseconds(15000);
-    while (m_running.load()) {
-        auto remaining = interval;
-        while (m_running.load() && remaining.count() > 0) {
-            auto slice = std::min(remaining, std::chrono::milliseconds(200));
-            std::this_thread::sleep_for(slice);
-            remaining -= slice;
-        }
-        if (m_running.load()) {
-            {
-                std::lock_guard<std::mutex> lk(m_mutex);
-                if (m_active_parent.empty()) {
-                    auto peers = m_transport->peers();
-                    for (const auto& parent_id : m_parent_ids) {
-                        for (const auto& p : peers) {
-                            if (p.id == parent_id && p.state == LinkState::Online) {
-                                m_active_parent = parent_id;
-                                m_all_parents_down.store(false);
-                                break;
-                            }
-                        }
-                        if (!m_active_parent.empty()) break;
-                    }
-                }
-            }
-            send_snapshot_to_parent();
-        }
-    }
 }
 
 void LeafRuntime::Impl::do_heartbeat_work() {
@@ -1197,7 +1063,14 @@ void LeafRuntime::Impl::record_metric(const std::string& direction, const std::s
     m_metrics_store->record(ev);
 }
 
-void LeafRuntime::Impl::set_framework(framework::Framework* fw) { m_framework = fw; }
+void LeafRuntime::Impl::set_framework(framework::Framework* fw) {
+    m_framework = fw;
+    if (fw) {
+        fw->set_batch_processor([this](const std::vector<framework::Message>& batch) {
+            return process_batch(batch);
+        });
+    }
+}
 
 framework::ChangeSet LeafRuntime::Impl::process_batch(const std::vector<framework::Message>& batch) {
     framework::ChangeSet cs;

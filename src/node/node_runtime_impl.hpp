@@ -19,7 +19,6 @@
 #include <memory>
 #include <mutex>
 #include <string>
-#include <thread>
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
@@ -60,8 +59,6 @@ private:
     void broadcast_snapshot_locked();
     void push_to_leaves_locked();
     void revoke_leaf_locked(const std::string& leaf_id);
-    void m_redissync_loop();
-    void sync_loop();
     void do_sync_work();
     void do_redis_sync_work();
     void record_metric(const std::string& direction, const std::string& rpc_name,
@@ -79,8 +76,6 @@ private:
     std::unordered_map<std::string, std::unordered_set<std::string>> m_leaf_endpoints;
     std::uint64_t m_version_counter{};
     std::atomic<bool> m_running{false};
-    std::thread m_sync_thread;
-    std::thread m_redissync_thread_;
     std::mutex m_mutex;
     framework::TaskId m_sync_task_id{0};
     framework::TaskId m_redis_sync_task_id{0};
