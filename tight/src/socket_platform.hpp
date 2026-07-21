@@ -14,6 +14,7 @@ typedef int socklen_t;
 #else
 #include <arpa/inet.h>
 #include <netinet/in.h>
+#include <netdb.h>
 #include <sys/socket.h>
 #include <sys/select.h>
 #include <unistd.h>
@@ -21,7 +22,7 @@ typedef int socklen_t;
 #include <errno.h>
 #endif
 
-namespace creek::tight_detail {
+namespace tight::tight_detail {
 
 #ifdef _WIN32
 using NativeSocket = SOCKET;
@@ -35,15 +36,15 @@ inline constexpr NativeSocket kInvalidSocket = INVALID_SOCKET;
 inline void close_socket(NativeSocket s) { closesocket(s); }
 inline int last_socket_error() { return WSAGetLastError(); }
 inline bool would_block(int e) { return e == WSAEWOULDBLOCK; }
-inline int creek_setsockopt(NativeSocket s, int level, int optname,
+inline int tight_setsockopt(NativeSocket s, int level, int optname,
                             const char* optval, int optlen) {
     return ::setsockopt(s, level, optname, optval, optlen);
 }
-inline int creek_recvfrom(NativeSocket s, char* buf, int len, int flags,
-                          sockaddr* from, int* fromlen) {
+inline int tight_recvfrom(NativeSocket s, char* buf, int len, int flags,
+                          sockaddr* from, SockLen* fromlen) {
     return ::recvfrom(s, buf, len, flags, from, fromlen);
 }
-inline int creek_sendto(NativeSocket s, const char* buf, int len, int flags,
+inline int tight_sendto(NativeSocket s, const char* buf, int len, int flags,
                         const sockaddr* to, int tolen) {
     return ::sendto(s, buf, len, flags, to, tolen);
 }
@@ -54,15 +55,15 @@ inline constexpr NativeSocket kInvalidSocket = -1;
 inline void close_socket(NativeSocket s) { ::close(s); }
 inline int last_socket_error() { return errno; }
 inline bool would_block(int e) { return e == EWOULDBLOCK || e == EAGAIN; }
-inline int creek_setsockopt(NativeSocket s, int level, int optname,
+inline int tight_setsockopt(NativeSocket s, int level, int optname,
                             const char* optval, int optlen) {
     return ::setsockopt(s, level, optname, optval, optlen);
 }
-inline int creek_recvfrom(NativeSocket s, char* buf, int len, int flags,
-                          sockaddr* from, int* fromlen) {
+inline int tight_recvfrom(NativeSocket s, char* buf, int len, int flags,
+                          sockaddr* from, SockLen* fromlen) {
     return ::recvfrom(s, buf, len, flags, from, fromlen);
 }
-inline int creek_sendto(NativeSocket s, const char* buf, int len, int flags,
+inline int tight_sendto(NativeSocket s, const char* buf, int len, int flags,
                         const sockaddr* to, int tolen) {
     return ::sendto(s, buf, len, flags, to, tolen);
 }

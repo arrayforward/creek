@@ -1,5 +1,4 @@
-#include "creek/tight.hpp"
-#include "creek/types.hpp"
+#include "tight/tight.hpp"
 
 #include <atomic>
 #include <chrono>
@@ -8,12 +7,14 @@
 #include <iostream>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <random>
 #include <string>
 #include <thread>
+#include <utility>
 #include <vector>
 
-using namespace creek;
+using namespace tight;
 using namespace std::chrono_literals;
 
 namespace {
@@ -28,6 +29,9 @@ int tests = 0;
         ++failures; \
     } \
 } while (0)
+
+// Wire-format header size (the public codec no longer exposes it).
+constexpr std::size_t kHeaderSize = 48;
 
 void test_packet_codec_roundtrip() {
     PacketHeader header{};
@@ -48,7 +52,7 @@ void test_packet_codec_roundtrip() {
 
     Bytes payload{0xAA, 0xBB, 0xCC};
     Bytes encoded = PacketCodec::encode(header, payload);
-    CHECK(encoded.size() == PacketCodec::header_size + payload.size());
+    CHECK(encoded.size() == kHeaderSize + payload.size());
 
     PacketHeader decoded{};
     Bytes decoded_payload;
@@ -69,6 +73,7 @@ void test_packet_codec_roundtrip() {
     CHECK(decoded.checksum != 0);
     CHECK(decoded_payload == payload);
 
+    header.payload_size = 0;
     Bytes empty_payload;
     Bytes empty_encoded = PacketCodec::encode(header, empty_payload);
     PacketHeader dh{};
@@ -84,10 +89,13 @@ void test_packet_codec_roundtrip() {
     Bytes big(2048, 0x5A);
     for (std::size_t i = 0; i < big.size(); ++i) big[i] = static_cast<std::uint8_t>(i & 0xFF);
     PacketHeader bh{};
+    bh.magic = 0x54474854U;
+    bh.version = 1;
     bh.type = PacketType::Data;
     bh.message_id = 99;
     bh.fragment_index = 0;
     bh.fragment_count = 1;
+    bh.payload_size = static_cast<std::uint16_t>(big.size());
     Bytes big_enc = PacketCodec::encode(bh, big);
     PacketHeader bh2{};
     Bytes bp2;
@@ -97,6 +105,8 @@ void test_packet_codec_roundtrip() {
 
 void test_crc_corruption() {
     PacketHeader header{};
+    header.magic = 0x54474854U;
+    header.version = 1;
     header.type = PacketType::Data;
     header.client_id = 1;
     header.session_id = 2;
@@ -105,6 +115,7 @@ void test_crc_corruption() {
     header.fragment_index = 0;
     header.fragment_count = 1;
     Bytes payload{'h','e','l','l','o'};
+    header.payload_size = static_cast<std::uint16_t>(payload.size());
 
     Bytes encoded = PacketCodec::encode(header, payload);
     PacketHeader decoded{};
@@ -113,7 +124,7 @@ void test_crc_corruption() {
     CHECK(decoded_payload == payload);
 
     Bytes corrupt = encoded;
-    corrupt[PacketCodec::header_size + 2] ^= 0xFF;
+    corrupt[kHeaderSize + 2] ^= 0xFF;
     PacketHeader dh{};
     Bytes dp;
     CHECK(!PacketCodec::decode(corrupt, dh, dp));
@@ -145,45 +156,67 @@ void test_crc_corruption() {
 }
 
 void test_fec_recovery() {
+    // Single parity shard reduces to a plain XOR of all data shards.
     std::vector<Bytes> fragments;
     fragments.push_back(Bytes{1, 2, 3, 4});
     fragments.push_back(Bytes{5, 6, 7, 8});
     fragments.push_back(Bytes{9, 10, 11, 12});
     fragments.push_back(Bytes{13, 14, 15, 16});
 
-    Bytes parity = ReedSolomon::parity(fragments, 4);
+    auto parities = ReedSolomon::encode(fragments, 1, 4);
+    CHECK(parities.size() == 1);
     Bytes expected{static_cast<std::uint8_t>(1 ^ 5 ^ 9 ^ 13),
                    static_cast<std::uint8_t>(0x02 ^ 0x06 ^ 0x0A ^ 0x0E),
                    static_cast<std::uint8_t>(0x03 ^ 0x07 ^ 0x0B ^ 0x0F),
                    static_cast<std::uint8_t>(0x04 ^ 0x08 ^ 0x0C ^ 0x10)};
-    CHECK(parity == expected);
+    CHECK(parities[0] == expected);
 
-    std::vector<Bytes> lost = fragments;
-    lost[2].clear();
-    CHECK(ReedSolomon::recover_one(lost, parity, 2, 4));
-    CHECK(lost[2] == Bytes({9, 10, 11, 12}));
+    auto try_recover = [&](std::size_t missing, const Bytes& original) {
+        std::vector<std::optional<Bytes>> data;
+        for (const auto& f : fragments) data.push_back(f);
+        data[missing].reset();
+        std::vector<std::pair<std::size_t, Bytes>> parity_list{{0, parities[0]}};
+        if (!ReedSolomon::decode(data, parity_list, 4)) return false;
+        return data[missing].has_value() && *data[missing] == original;
+    };
+    CHECK(try_recover(2, Bytes{9, 10, 11, 12}));
+    CHECK(try_recover(0, Bytes{1, 2, 3, 4}));
+    CHECK(try_recover(3, Bytes{13, 14, 15, 16}));
 
-    std::vector<Bytes> lost0 = fragments;
-    lost0[0].clear();
-    CHECK(ReedSolomon::recover_one(lost0, parity, 0, 4));
-    CHECK(lost0[0] == Bytes({1, 2, 3, 4}));
-
-    std::vector<Bytes> lost3 = fragments;
-    lost3[3].clear();
-    CHECK(ReedSolomon::recover_one(lost3, parity, 3, 4));
-    CHECK(lost3[3] == Bytes({13, 14, 15, 16}));
-
+    // Shards shorter than the width are treated as zero-padded.
     std::vector<Bytes> uneven = {
         Bytes{0x01, 0x02, 0x03, 0x04, 0x05},
         Bytes{0x10, 0x20},
         Bytes{0xAA, 0xBB, 0xCC, 0xDD}
     };
-    Bytes p2 = ReedSolomon::parity(uneven, 5);
-    CHECK(p2.size() == 5);
-    std::vector<Bytes> rec = uneven;
-    rec[1].clear();
-    CHECK(ReedSolomon::recover_one(rec, p2, 1, 5));
-    CHECK(rec[1].size() == 5);
+    auto p2 = ReedSolomon::encode(uneven, 1, 5);
+    CHECK(p2.size() == 1);
+    CHECK(p2[0].size() == 5);
+    std::vector<std::optional<Bytes>> rec;
+    for (const auto& f : uneven) rec.push_back(f);
+    rec[1].reset();
+    std::vector<std::pair<std::size_t, Bytes>> pl2{{0, p2[0]}};
+    CHECK(ReedSolomon::decode(rec, pl2, 5));
+    CHECK(rec[1].has_value() && rec[1]->size() == 5);
+    CHECK((*rec[1])[0] == 0x10 && (*rec[1])[1] == 0x20);
+
+    // Two parity shards recover any two missing data shards.
+    std::vector<Bytes> frags;
+    for (int i = 0; i < 6; ++i) {
+        Bytes f(8);
+        for (int j = 0; j < 8; ++j) f[j] = static_cast<std::uint8_t>(i * 8 + j);
+        frags.push_back(std::move(f));
+    }
+    auto p3 = ReedSolomon::encode(frags, 2, 8);
+    CHECK(p3.size() == 2);
+    std::vector<std::optional<Bytes>> d3;
+    for (const auto& f : frags) d3.push_back(f);
+    d3[1].reset();
+    d3[4].reset();
+    std::vector<std::pair<std::size_t, Bytes>> pl3{{0, p3[0]}, {1, p3[1]}};
+    CHECK(ReedSolomon::decode(d3, pl3, 8));
+    CHECK(d3[1].has_value() && *d3[1] == frags[1]);
+    CHECK(d3[4].has_value() && *d3[4] == frags[4]);
 }
 
 void test_bandwidth_estimator() {
@@ -204,8 +237,10 @@ void test_bandwidth_estimator() {
 
     BandwidthEstimator bw2(100000);
     bw2.on_ack(1000, 100us);
+    // Delivery sample = 10 MB/s; the BBR probe gain (x1.25) may push the
+    // paced estimate above the raw sample.
     CHECK(bw2.bytes_per_second() > 100000);
-    CHECK(bw2.bytes_per_second() < 10000000);
+    CHECK(bw2.bytes_per_second() <= 20000000);
 
     BandwidthEstimator bw3(0);
     bw3.on_ack(5000, 1000us);
@@ -236,11 +271,12 @@ struct TwoTransportFixture {
         TightConfig ca{};
         ca.id = "alpha";
         ca.role = LinkRole::Node;
-        ca.bind = Address{"127.0.0.1", 0};
+        ca.bind = NetAddress{"127.0.0.1", 0};
         ca.token = "secret-token";
         ca.heartbeat = 50ms;
         ca.dead_timeout = 1500ms;
         ca.retransmit_timeout = 50ms;
+        ca.report_interval = 100ms;
         ca.flush_interval = 10ms;
         ca.mtu = 600;
         ca.initial_bandwidth_bytes = 50ULL * 1024 * 1024;
@@ -267,11 +303,12 @@ struct TwoTransportFixture {
         TightConfig cb{};
         cb.id = "beta";
         cb.role = LinkRole::Leaf;
-        cb.bind = Address{"127.0.0.1", 0};
+        cb.bind = NetAddress{"127.0.0.1", 0};
         cb.token = "secret-token";
         cb.heartbeat = 50ms;
         cb.dead_timeout = 1500ms;
         cb.retransmit_timeout = 50ms;
+        cb.report_interval = 100ms;
         cb.flush_interval = 10ms;
         cb.mtu = 600;
         cb.initial_bandwidth_bytes = 50ULL * 1024 * 1024;
@@ -387,11 +424,12 @@ void test_two_transport_handshake_and_big_message() {
 void test_token_mismatch_blocks_handshake() {
     TightConfig ca{};
     ca.id = "x";
-    ca.bind = Address{"127.0.0.1", 0};
+    ca.bind = NetAddress{"127.0.0.1", 0};
     ca.token = "right";
     ca.heartbeat = 50ms;
     ca.dead_timeout = 1000ms;
     ca.retransmit_timeout = 50ms;
+    ca.report_interval = 100ms;
     ca.flush_interval = 10ms;
     ca.mtu = 600;
     ca.initial_bandwidth_bytes = 10ULL * 1024 * 1024;
@@ -399,11 +437,12 @@ void test_token_mismatch_blocks_handshake() {
 
     TightConfig cb{};
     cb.id = "y";
-    cb.bind = Address{"127.0.0.1", 0};
+    cb.bind = NetAddress{"127.0.0.1", 0};
     cb.token = "wrong";
     cb.heartbeat = 50ms;
     cb.dead_timeout = 1000ms;
     cb.retransmit_timeout = 50ms;
+    cb.report_interval = 100ms;
     cb.flush_interval = 10ms;
     cb.mtu = 600;
     cb.initial_bandwidth_bytes = 10ULL * 1024 * 1024;

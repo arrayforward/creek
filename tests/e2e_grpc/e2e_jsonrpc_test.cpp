@@ -28,6 +28,9 @@
 #include <netinet/in.h>
 #include <sys/socket.h>
 #include <sys/types.h>
+#include <sys/wait.h>
+#include <fcntl.h>
+#include <signal.h>
 #include <unistd.h>
 #endif
 
@@ -103,7 +106,7 @@ bool tcp_connect_ok(const std::string& host, int port, int timeout_ms) {
         timeval tv{};
         tv.tv_sec = 0;
         tv.tv_usec = 100 * 1000;
-        int sr = ::select(0, nullptr, &fds, nullptr, &tv);
+        int sr = ::select(static_cast<int>(s) + 1, nullptr, &fds, nullptr, &tv);
         if (sr > 0) {
             int so_error = 0;
             socklen_t len = sizeof(so_error);
@@ -168,7 +171,7 @@ std::string http_post_json(int port, const std::string& body,
 #endif
         fd_set fds; FD_ZERO(&fds); FD_SET(s, &fds);
         timeval tv{}; tv.tv_sec = 0; tv.tv_usec = 100 * 1000;
-        int sr = ::select(0, nullptr, &fds, nullptr, &tv);
+        int sr = ::select(static_cast<int>(s) + 1, nullptr, &fds, nullptr, &tv);
         if (sr > 0) {
             int so_error = 0;
             socklen_t len = sizeof(so_error);
@@ -219,7 +222,7 @@ std::string http_post_json(int port, const std::string& body,
             100 * 1000,
             std::chrono::duration_cast<std::chrono::microseconds>(write_deadline - now).count()));
         fd_set wfds; FD_ZERO(&wfds); FD_SET(s, &wfds);
-        int sr = ::select(0, nullptr, &wfds, nullptr, &tv);
+        int sr = ::select(static_cast<int>(s) + 1, nullptr, &wfds, nullptr, &tv);
         if (sr <= 0) continue;
         int n = ::send(s, p, static_cast<int>(remaining), 0);
         if (n <= 0) { error_out = "send failed"; break; }

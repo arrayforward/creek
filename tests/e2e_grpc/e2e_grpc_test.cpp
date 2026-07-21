@@ -26,6 +26,9 @@
 #include <netinet/in.h>
 #include <sys/socket.h>
 #include <sys/types.h>
+#include <sys/wait.h>
+#include <fcntl.h>
+#include <signal.h>
 #include <unistd.h>
 #endif
 
@@ -100,7 +103,7 @@ bool tcp_connect_ok(const std::string& host, int port, int timeout_ms) {
         timeval tv{};
         tv.tv_sec = 0;
         tv.tv_usec = 100 * 1000;
-        int sr = ::select(0, nullptr, &fds, nullptr, &tv);
+        int sr = ::select(static_cast<int>(s) + 1, nullptr, &fds, nullptr, &tv);
         if (sr > 0) {
             int so_error = 0;
             socklen_t len = sizeof(so_error);

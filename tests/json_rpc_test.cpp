@@ -1,7 +1,6 @@
 #include "creek/json_rpc.hpp"
 
-#include <winsock2.h>
-#include <ws2tcpip.h>
+#include "../src/socket_compat.hpp"
 
 #include <atomic>
 #include <chrono>
@@ -30,8 +29,7 @@ std::string http_post(int port, const std::string& body,
     std::string host = "127.0.0.1";
     std::string port_str = std::to_string(port);
 
-    WSADATA wsa;
-    WSAStartup(MAKEWORD(2, 2), &wsa);
+    creek::socket_startup();
 
     SOCKET s = ::socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
     sockaddr_in addr{};
@@ -60,7 +58,7 @@ std::string http_post(int port, const std::string& body,
         response.append(buf, n);
     }
     ::closesocket(s);
-    WSACleanup();
+    creek::socket_cleanup();
     return response;
 }
 
@@ -147,8 +145,7 @@ void test_healthz() {
     std::uint16_t port = server.local_port();
 
     std::string host = "127.0.0.1";
-    WSADATA wsa;
-    WSAStartup(MAKEWORD(2, 2), &wsa);
+    creek::socket_startup();
     SOCKET s = ::socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
     sockaddr_in addr{};
     addr.sin_family = AF_INET;
@@ -162,7 +159,7 @@ void test_healthz() {
     char buf[4096];
     while (true) { int n = ::recv(s, buf, sizeof(buf), 0); if (n <= 0) break; resp.append(buf, n); }
     ::closesocket(s);
-    WSACleanup();
+    creek::socket_cleanup();
 
     EXPECT(resp.find("200") != std::string::npos, "healthz should return 200");
 
@@ -185,8 +182,7 @@ void test_stop_restart() {
 }
 
 int main() {
-    WSADATA wsa;
-    WSAStartup(MAKEWORD(2, 2), &wsa);
+    creek::socket_startup();
 
     test_basic_json_rpc();
     test_sticky_via_header();
@@ -194,7 +190,7 @@ int main() {
     test_healthz();
     test_stop_restart();
 
-    WSACleanup();
+    creek::socket_cleanup();
     std::fprintf(stdout, "JSON-RPC Tests: Passed=%d Failed=%d\n", g_passed, g_failed);
     return g_failed == 0 ? 0 : 1;
 }

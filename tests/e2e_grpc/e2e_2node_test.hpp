@@ -12,14 +12,23 @@
 #include <string>
 #include <vector>
 
+#ifdef _WIN32
+#include <windows.h>
+#else
+#include <unistd.h>
+#endif
+
 namespace creek::e2e {
 
 struct ChildProcess {
     std::string tag;
     std::string exe;
     std::string args;
+    int pid{0};
+#ifdef _WIN32
     PROCESS_INFORMATION proc{};
     HANDLE job{nullptr};
+#endif
     std::string stdout_path;
     std::string stderr_path;
 };

@@ -6,11 +6,15 @@
 #include <cstddef>
 #include <cstdint>
 
-namespace creek::tight_detail {
+namespace tight::tight_detail {
 
 inline constexpr std::uint32_t kMagic = 0x54474854U;
 inline constexpr std::uint8_t kVersion = 1;
 inline constexpr std::size_t kHeaderSize = 48;
+
+// flags 字段高位：负载为 AES-256-GCM 密文（低位仍保留原语义，
+// 对数据报文即数据分片数 data_cnt）
+inline constexpr std::uint16_t kFlagEncrypted = 0x8000;
 
 inline std::uint16_t to_be16(std::uint16_t v) {
     return static_cast<std::uint16_t>(((v & 0x00FFU) << 8) | ((v & 0xFF00U) >> 8));

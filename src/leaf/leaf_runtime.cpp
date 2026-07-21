@@ -64,9 +64,17 @@ bool LeafRuntime::Impl::start() {
     TightConfig tc;
     tc.id = m_config.id;
     tc.role = LinkRole::Leaf;
-    tc.bind = m_config.udp_bind;
+    tc.bind = to_tight_address(m_config.udp_bind);
     tc.token = m_config.token;
+    tc.heartbeat = std::chrono::milliseconds(100);
+    tc.report_interval = std::chrono::milliseconds(100);
+    tc.retransmit_timeout = std::chrono::milliseconds(100);
+    tc.flush_interval = std::chrono::milliseconds(10);
     tc.dead_timeout = std::chrono::milliseconds(30000);
+    tc.mtu = 1200;
+    tc.queue_limit = 4096;
+    tc.initial_bandwidth_bytes = 10ULL * 1024 * 1024;
+    tc.max_message_bytes = 1024 * 1024;
 
     m_transport = std::make_unique<TightTransport>(tc);
     m_transport->set_message_callback([this](const std::string& peer_id, Bytes payload) {
@@ -84,7 +92,7 @@ bool LeafRuntime::Impl::start() {
     for (const auto& parent : m_config.parents) {
         if (!parent.id.empty()) {
             m_parent_ids.insert(parent.id);
-            m_transport->connect(parent);
+            m_transport->connect(to_tight_peer(parent));
         }
     }
 
@@ -540,7 +548,7 @@ grpc::Status LeafRuntime::Impl::send_routed_request(const creek::v1::Endpoint& e
         if (!target_addr.empty()) {
             auto parsed = parse_address(target_addr);
             if (parsed) {
-                m_transport->connect({target_id, *parsed});
+                m_transport->connect({target_id, to_tight_address(*parsed)});
                 sent = m_transport->send_priority(target_id, payload, 1);
             }
         }

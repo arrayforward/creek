@@ -9,10 +9,7 @@
 #include <sstream>
 #include <string>
 
-#define WIN32_LEAN_AND_MEAN
-#include <winsock2.h>
-#include <ws2tcpip.h>
-#include <windows.h>
+#include "socket_compat.hpp"
 
 namespace creek {
 
@@ -197,8 +194,7 @@ public:
         if (stopped_) return false;
 
         if (!wsa_initialized_) {
-            WSADATA wsa_data{};
-            if (WSAStartup(MAKEWORD(2, 2), &wsa_data) != 0) return false;
+            if (!socket_startup()) return false;
             wsa_initialized_ = true;
         }
 
@@ -218,7 +214,7 @@ public:
         if (stopped_) return;
         stopped_ = true;
         if (wsa_initialized_) {
-            WSACleanup();
+            socket_cleanup();
             wsa_initialized_ = false;
         }
     }

@@ -3,7 +3,7 @@
 #include <array>
 #include <mutex>
 
-namespace creek::tight_detail {
+namespace tight::tight_detail {
 
 namespace {
 
@@ -22,13 +22,16 @@ void init_crc_table() {
 
 }
 
-std::uint32_t crc32_compute(const std::uint8_t* data, std::size_t size) {
+std::uint32_t crc32_update(std::uint32_t crc, const std::uint8_t* data, std::size_t size) {
     std::call_once(g_crc_table_once, init_crc_table);
-    std::uint32_t crc = 0xFFFFFFFFU;
     for (std::size_t i = 0; i < size; ++i) {
         crc = g_crc_table[(crc ^ data[i]) & 0xFFU] ^ (crc >> 8);
     }
-    return crc ^ 0xFFFFFFFFU;
+    return crc;
+}
+
+std::uint32_t crc32_compute(const std::uint8_t* data, std::size_t size) {
+    return crc32_update(0xFFFFFFFFU, data, size) ^ 0xFFFFFFFFU;
 }
 
 }

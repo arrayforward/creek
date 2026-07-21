@@ -6,6 +6,7 @@
 #include <atomic>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <map>
 #include <memory>
 #include <mutex>
@@ -15,10 +16,7 @@
 #include <utility>
 #include <vector>
 
-#define WIN32_LEAN_AND_MEAN
-#include <winsock2.h>
-#include <ws2tcpip.h>
-#include <windows.h>
+#include "socket_compat.hpp"
 
 namespace creek {
 
@@ -262,8 +260,7 @@ public:
     bool start() {
         if (running_.load()) return true;
         if (!wsa_initialized_.load()) {
-            int rc = WSAStartup(MAKEWORD(2, 2), &wsa_data_);
-            if (rc != 0) return false;
+            if (!socket_startup()) return false;
             wsa_initialized_.store(true);
         }
 
@@ -296,7 +293,7 @@ public:
 
         if (bind_.port == 0) {
             sockaddr_in actual{};
-            int len = sizeof(actual);
+            socklen_t len = sizeof(actual);
             if (getsockname(socket_, reinterpret_cast<sockaddr*>(&actual), &len) == 0) {
                 actual_port_ = ntohs(actual.sin_port);
             } else {
@@ -314,8 +311,9 @@ public:
     void stop() {
         if (!running_.exchange(false)) return;
         if (socket_ != INVALID_SOCKET) {
-            ::closesocket(socket_);
-            socket_ = INVALID_SOCKET;
+            // shutdown() makes a blocked accept() return immediately on
+            // Linux (plain close() from another thread does not).
+            ::shutdown(socket_, SHUT_RDWR);
         }
         if (thread_.joinable()) thread_.join();
         cleanup_socket();
@@ -330,14 +328,14 @@ private:
             socket_ = INVALID_SOCKET;
         }
         if (wsa_initialized_.exchange(false)) {
-            WSACleanup();
+            socket_cleanup();
         }
     }
 
     void run_loop() {
         while (running_.load()) {
             sockaddr_in client_addr{};
-            int client_len = sizeof(client_addr);
+            socklen_t client_len = sizeof(client_addr);
             SOCKET client = ::accept(socket_,
                                     reinterpret_cast<sockaddr*>(&client_addr),
                                     &client_len);
@@ -480,7 +478,6 @@ private:
     Address bind_;
     SOCKET socket_{INVALID_SOCKET};
     std::uint16_t actual_port_{};
-    WSADATA wsa_data_{};
     std::atomic<bool> wsa_initialized_{false};
     std::atomic<bool> running_{false};
     std::thread thread_;

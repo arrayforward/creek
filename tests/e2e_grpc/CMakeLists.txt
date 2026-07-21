@@ -7,8 +7,13 @@
 # ENVIRONMENT in set_tests_properties keeps only the LAST value, which used to
 # drop PATH/CREEK_SIDECAR/... and made the tests silently GTEST_SKIP. The
 # property is a ';'-separated list, so ';' inside PATH is escaped as '\;'.
-string(REPLACE ";" "\\;" CREEK_E2E_ESCAPED_PATH "$ENV{PATH}")
-set(CREEK_E2E_PATH "PATH=${CMAKE_BINARY_DIR}/bin\;D:/msys64/mingw64/bin\;${CREEK_E2E_ESCAPED_PATH}")
+if(WIN32)
+    string(REPLACE ";" "\\;" CREEK_E2E_ESCAPED_PATH "$ENV{PATH}")
+    set(CREEK_E2E_ENV_PREFIX "PATH=${CMAKE_BINARY_DIR}/bin\;D:/msys64/mingw64/bin\;${CREEK_E2E_ESCAPED_PATH};")
+else()
+    set(CREEK_E2E_ENV_PREFIX "")
+endif()
+set(CREEK_E2E_LOG_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../e2e-logs")
 
 add_executable(creek_e2e_2node
     e2e_2node_test.cpp
@@ -29,7 +34,7 @@ set_tests_properties(creek_e2e_2node PROPERTIES
     # Set working directory to the binary dir so DLLs (gRPC, absl, etc.) are
     # found next to the executable on Windows.
     WORKING_DIRECTORY ${CMAKE_BINARY_DIR}/bin
-    ENVIRONMENT "${CREEK_E2E_PATH};CREEK_SIDECAR=$<TARGET_FILE:creek_sidecar>;CREEK_HELLO_SERVER=$<TARGET_FILE:creek_hello_server>;CREEK_HELLO_CLIENT=$<TARGET_FILE:creek_hello_client>;CREEK_REDIS_HOST=127.0.0.1;CREEK_REDIS_PORT=6379;CREEK_REDIS_PASS=creekredis;CREEK_REDIS_KEY=creek.nodes;CREEK_E2E_LOG_DIR=D:/vit/creek/tests/e2e-logs;CREEK_E2E_TOKEN=test-e2e-token"
+    ENVIRONMENT "${CREEK_E2E_ENV_PREFIX}CREEK_SIDECAR=$<TARGET_FILE:creek_sidecar>;CREEK_HELLO_SERVER=$<TARGET_FILE:creek_hello_server>;CREEK_HELLO_CLIENT=$<TARGET_FILE:creek_hello_client>;CREEK_REDIS_HOST=127.0.0.1;CREEK_REDIS_PORT=6379;CREEK_REDIS_PASS=creekredis;CREEK_REDIS_KEY=creek.nodes;CREEK_E2E_LOG_DIR=${CREEK_E2E_LOG_DIR};CREEK_E2E_TOKEN=test-e2e-token"
 )
 
 # 5-component end-to-end gRPC test (2 nodes + 3 leaves + 2 backends).
@@ -52,7 +57,7 @@ set_tests_properties(creek_e2e_grpc PROPERTIES
     TIMEOUT 300
     RUN_SERIAL TRUE
     WORKING_DIRECTORY ${CMAKE_BINARY_DIR}/bin
-    ENVIRONMENT "${CREEK_E2E_PATH};CREEK_SIDECAR=$<TARGET_FILE:creek_sidecar>;CREEK_HELLO_SERVER=$<TARGET_FILE:creek_hello_server>;CREEK_E2E_LOG_DIR=D:/vit/creek/tests/e2e-logs;CREEK_E2E_TOKEN=test-e2e-token"
+    ENVIRONMENT "${CREEK_E2E_ENV_PREFIX}CREEK_SIDECAR=$<TARGET_FILE:creek_sidecar>;CREEK_HELLO_SERVER=$<TARGET_FILE:creek_hello_server>;CREEK_E2E_LOG_DIR=${CREEK_E2E_LOG_DIR};CREEK_E2E_TOKEN=test-e2e-token"
 )
 
 # 5-component end-to-end JSON-RPC test (HTTP/JSON client).
@@ -75,5 +80,5 @@ set_tests_properties(creek_e2e_jsonrpc PROPERTIES
     TIMEOUT 300
     RUN_SERIAL TRUE
     WORKING_DIRECTORY ${CMAKE_BINARY_DIR}/bin
-    ENVIRONMENT "${CREEK_E2E_PATH};CREEK_SIDECAR=$<TARGET_FILE:creek_sidecar>;CREEK_HELLO_SERVER=$<TARGET_FILE:creek_hello_server>;CREEK_E2E_LOG_DIR=D:/vit/creek/tests/e2e-logs;CREEK_E2E_TOKEN=test-e2e-token"
+    ENVIRONMENT "${CREEK_E2E_ENV_PREFIX}CREEK_SIDECAR=$<TARGET_FILE:creek_sidecar>;CREEK_HELLO_SERVER=$<TARGET_FILE:creek_hello_server>;CREEK_E2E_LOG_DIR=${CREEK_E2E_LOG_DIR};CREEK_E2E_TOKEN=test-e2e-token"
 )

@@ -1,10 +1,6 @@
 #include "creek/json_rpc.hpp"
 
-#ifdef _WIN32
-#define WIN32_LEAN_AND_MEAN
-#include <winsock2.h>
-#include <ws2tcpip.h>
-#endif
+#include "socket_compat.hpp"
 
 #include <algorithm>
 #include <atomic>
@@ -121,8 +117,13 @@ public:
 
     void stop() {
         if (!running_.exchange(false)) return;
-        close_socket();
+        if (socket_ != kInvalid) {
+            // shutdown() makes a blocked accept() return immediately on
+            // Linux (plain close() from another thread does not).
+            ::shutdown(socket_, SHUT_RDWR);
+        }
         if (thread_.joinable()) thread_.join();
+        close_socket();
     }
 
     std::uint16_t local_port() const { return actual_port_; }

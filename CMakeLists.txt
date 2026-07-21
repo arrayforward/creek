@@ -9,12 +9,37 @@ set(CMAKE_RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
 set(CMAKE_LIBRARY_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
 set(CMAKE_ARCHIVE_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/lib")
 
-find_package(Protobuf CONFIG REQUIRED)
-find_package(gRPC CONFIG REQUIRED)
+find_package(Protobuf CONFIG QUIET)
+if(NOT Protobuf_FOUND)
+    # Fallback for distro packages without CMake config files (e.g. Ubuntu).
+    find_package(Protobuf MODULE REQUIRED)
+endif()
+find_package(gRPC CONFIG QUIET)
+if(NOT gRPC_FOUND)
+    # Fallback for distro packages without CMake config files (e.g. Ubuntu):
+    # use pkg-config and the system grpc_cpp_plugin.
+    find_package(PkgConfig REQUIRED)
+    pkg_check_modules(GRPCPP REQUIRED IMPORTED_TARGET grpc++)
+    find_library(CREEK_GRPCPP_REFLECTION_LIBRARY NAMES grpc++_reflection REQUIRED)
+    find_program(CREEK_GRPC_CPP_PLUGIN NAMES grpc_cpp_plugin REQUIRED)
+    add_library(creek_grpc_interface INTERFACE)
+    target_link_libraries(creek_grpc_interface INTERFACE
+        PkgConfig::GRPCPP
+        "${CREEK_GRPCPP_REFLECTION_LIBRARY}"
+    )
+    add_library(gRPC::grpc++ ALIAS creek_grpc_interface)
+    add_library(gRPC::grpc++_reflection ALIAS creek_grpc_interface)
+    add_executable(gRPC::grpc_cpp_plugin IMPORTED GLOBAL)
+    set_target_properties(gRPC::grpc_cpp_plugin PROPERTIES
+        IMPORTED_LOCATION "${CREEK_GRPC_CPP_PLUGIN}")
+endif()
 find_package(nlohmann_json CONFIG REQUIRED)
 find_package(GTest CONFIG REQUIRED)
 find_package(Threads REQUIRED)
 find_package(Python3 COMPONENTS Interpreter)
+
+# tight reliable-UDP transport library (standalone, lives in tight/).
+add_subdirectory(tight)
 
 find_path(CREEK_OPENSSL_INCLUDE_DIR
     NAMES openssl/evp.h
@@ -100,6 +125,7 @@ target_include_directories(creek_core PUBLIC "${CMAKE_CURRENT_SOURCE_DIR}/includ
 target_link_libraries(creek_core
     PUBLIC
         creek_proto
+        tight
         nlohmann_json::nlohmann_json
         Threads::Threads
 )

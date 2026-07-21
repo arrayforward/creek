@@ -24,3 +24,4 @@ skills/
 *.ilk
 *.exp
 *.log
+build-wsl/

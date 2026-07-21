@@ -6,7 +6,7 @@
 #include <mutex>
 #endif
 
-namespace creek::tight_detail {
+namespace tight::tight_detail {
 
 #ifdef _WIN32
 

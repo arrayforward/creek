@@ -8,7 +8,7 @@
 #include <cstdint>
 #include <string>
 
-namespace creek::tight_detail {
+namespace tight::tight_detail {
 
 bool resolve_address(const std::string& host, std::uint16_t port, sockaddr_in& out);
 

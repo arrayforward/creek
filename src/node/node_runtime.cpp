@@ -35,9 +35,17 @@ bool NodeRuntime::Impl::start() {
     TightConfig tc;
     tc.id = m_config.id;
     tc.role = LinkRole::Node;
-    tc.bind = m_config.udp_bind;
+    tc.bind = to_tight_address(m_config.udp_bind);
     tc.token = m_config.token;
+    tc.heartbeat = std::chrono::milliseconds(100);
+    tc.report_interval = std::chrono::milliseconds(100);
+    tc.retransmit_timeout = std::chrono::milliseconds(100);
+    tc.flush_interval = std::chrono::milliseconds(10);
     tc.dead_timeout = std::chrono::milliseconds(30000);
+    tc.mtu = 1200;
+    tc.queue_limit = 4096;
+    tc.initial_bandwidth_bytes = 10ULL * 1024 * 1024;
+    tc.max_message_bytes = 1024 * 1024;
 
     m_transport = std::make_unique<TightTransport>(tc);
     m_transport->set_message_callback([this](const std::string& peer_id, Bytes payload) {
@@ -57,7 +65,7 @@ bool NodeRuntime::Impl::start() {
         for (const auto& peer : m_config.peers) {
             if (peer.id.empty()) continue;
             m_known_node_peers.insert(peer.id);
-            m_transport->connect(peer);
+            m_transport->connect(to_tight_peer(peer));
         }
     }
 
@@ -419,7 +427,7 @@ void NodeRuntime::Impl::do_redis_sync_work() {
                     auto addr = parse_address(addr_str);
                     if (addr) {
                         m_known_node_peers.insert(node_id);
-                        m_transport->connect({node_id, *addr});
+                        m_transport->connect({node_id, to_tight_address(*addr)});
                     }
                 }
             }
@@ -433,7 +441,7 @@ void NodeRuntime::Impl::do_redis_sync_work() {
                     auto addr = parse_address(leaf_addr);
                     if (addr) {
                         m_leaves[leaf_id] = SteadyClock::now();
-                        m_transport->connect({leaf_id, *addr});
+                            m_transport->connect({leaf_id, to_tight_address(*addr)});
                     }
                 }
             }

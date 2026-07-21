@@ -1,7 +1,28 @@
 #pragma once
 
-// Main public API header for the tight UDP reliable transport library.
-// This header is kept at its original location for backward compatibility;
-// the declarations now live in the sub-headers under include/creek/tight/.
+// Adapter header: the tight reliable-UDP transport now lives in the
+// standalone tight/ library (namespace tight, see tight/include/tight/).
+// This header re-exports the pieces the creek runtime uses and provides
+// conversions from the creek config types (creek::Address / creek::RemotePeer)
+// to their tight counterparts.
 
-#include "creek/tight/tight.hpp"
+#include "creek/types.hpp"
+#include "tight/tight.hpp"
+
+namespace creek {
+
+using tight::LinkRole;
+using tight::LinkState;
+using tight::PeerEvent;
+using tight::TightConfig;
+using tight::TightTransport;
+
+inline tight::NetAddress to_tight_address(const Address& addr) {
+    return tight::NetAddress(addr.host, addr.port);
+}
+
+inline tight::RemotePeer to_tight_peer(const RemotePeer& peer) {
+    return tight::RemotePeer{peer.id, to_tight_address(peer.address)};
+}
+
+}

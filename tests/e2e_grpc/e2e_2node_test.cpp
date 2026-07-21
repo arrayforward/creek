@@ -1,8 +1,19 @@
 #include "e2e_2node_test.hpp"
 
+#ifdef _WIN32
 #include <winsock2.h>
 #include <ws2tcpip.h>
 #include <windows.h>
+#else
+#include <arpa/inet.h>
+#include <fcntl.h>
+#include <netinet/in.h>
+#include <signal.h>
+#include <sys/socket.h>
+#include <sys/types.h>
+#include <sys/wait.h>
+#include <unistd.h>
+#endif
 
 #include <algorithm>
 #include <chrono>
@@ -68,41 +79,64 @@ std::string build_cmd(const std::string& exe, const std::vector<std::string>& ar
 }
 
 bool tcp_connect_ok(const std::string& host, int port, int timeout_ms) {
+#ifdef _WIN32
     SOCKET s = ::socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
-    if (s == INVALID_SOCKET) return false;
+#else
+    int s = ::socket(AF_INET, SOCK_STREAM, 0);
+#endif
+    if (s < 0) return false;
     sockaddr_in addr{};
     addr.sin_family = AF_INET;
-    addr.sin_port = htons(static_cast<u_short>(port));
+    addr.sin_port = htons(static_cast<uint16_t>(port));
     if (::inet_pton(AF_INET, host.c_str(), &addr.sin_addr) != 1) {
+#ifdef _WIN32
         ::closesocket(s);
+#else
+        ::close(s);
+#endif
         return false;
     }
+#ifdef _WIN32
     u_long nb = 1;
     ::ioctlsocket(s, FIONBIO, &nb);
+#else
+    int fl = fcntl(s, F_GETFL, 0);
+    if (fl >= 0) fcntl(s, F_SETFL, fl | O_NONBLOCK);
+#endif
     auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(timeout_ms);
     bool ok = false;
     while (std::chrono::steady_clock::now() < deadline) {
         int r = ::connect(s, reinterpret_cast<sockaddr*>(&addr), sizeof(addr));
         if (r == 0) { ok = true; break; }
+#ifdef _WIN32
         int e = ::WSAGetLastError();
         if (e != WSAEWOULDBLOCK && e != WSAEINPROGRESS && e != WSAEALREADY) {
             break;
         }
+#else
+        if (errno != EINPROGRESS && errno != EALREADY && errno != EWOULDBLOCK) {
+            break;
+        }
+#endif
         fd_set fds;
         FD_ZERO(&fds);
         FD_SET(s, &fds);
         timeval tv{};
         tv.tv_sec = 0;
         tv.tv_usec = 100 * 1000;
-        int sr = ::select(0, nullptr, &fds, nullptr, &tv);
+        int sr = ::select(static_cast<int>(s) + 1, nullptr, &fds, nullptr, &tv);
         if (sr > 0) {
             int so_error = 0;
-            int len = sizeof(so_error);
+            socklen_t len = sizeof(so_error);
             ::getsockopt(s, SOL_SOCKET, SO_ERROR, reinterpret_cast<char*>(&so_error), &len);
             if (so_error == 0) { ok = true; break; }
         }
     }
+#ifdef _WIN32
     ::closesocket(s);
+#else
+    ::close(s);
+#endif
     return ok;
 }
 
@@ -131,8 +165,11 @@ struct ChildHandle {
     std::string args;
     std::string stdout_path;
     std::string stderr_path;
+    int pid{0};
+#ifdef _WIN32
     PROCESS_INFORMATION proc{};
     HANDLE job{nullptr};
+#endif
 };
 
 TestEnv::TestEnv(std::string sidecar, std::string hello_server, std::string hello_client,
@@ -174,6 +211,10 @@ std::shared_ptr<ChildHandle> TestEnv::spawn(const std::string& tag, const std::s
     handle->stdout_path = (fs::path(log_dir_) / (tag + ".log")).string();
     handle->stderr_path = (fs::path(log_dir_) / (tag + ".err")).string();
 
+    std::vector<std::string> arg_vec(args);
+    handle->args = build_cmd(exe, arg_vec);
+
+#ifdef _WIN32
     HANDLE job = ::CreateJobObjectW(nullptr, nullptr);
     if (job) {
         JOBOBJECT_EXTENDED_LIMIT_INFORMATION jb{};
@@ -198,8 +239,6 @@ std::shared_ptr<ChildHandle> TestEnv::spawn(const std::string& tag, const std::s
     si.hStdError = err_file;
     si.hStdInput = INVALID_HANDLE_VALUE;
 
-    std::vector<std::string> arg_vec(args);
-    handle->args = build_cmd(exe, arg_vec);
     std::string cmd_buf = handle->args;
 
     PROCESS_INFORMATION pi{};
@@ -220,7 +259,31 @@ std::shared_ptr<ChildHandle> TestEnv::spawn(const std::string& tag, const std::s
     }
     ::ResumeThread(pi.hThread);
     handle->proc = pi;
-    log_emit("spawn", tag + " pid=" + std::to_string(pi.dwProcessId));
+    handle->pid = static_cast<int>(pi.dwProcessId);
+#else
+    pid_t pid = fork();
+    if (pid < 0) {
+        log_emit("spawn", "fork failed");
+        return nullptr;
+    }
+    if (pid == 0) {
+        int fd_out = ::open(handle->stdout_path.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0644);
+        int fd_err = ::open(handle->stderr_path.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0644);
+        if (fd_out >= 0) { ::dup2(fd_out, 1); ::close(fd_out); }
+        if (fd_err >= 0) { ::dup2(fd_err, 2); ::close(fd_err); }
+        std::vector<std::string> argv;
+        argv.reserve(arg_vec.size() + 1);
+        argv.push_back(exe);
+        for (const auto& a : arg_vec) argv.push_back(a);
+        std::vector<char*> cargv;
+        for (auto& a : argv) cargv.push_back(a.data());
+        cargv.push_back(nullptr);
+        ::execv(exe.c_str(), cargv.data());
+        std::exit(127);
+    }
+    handle->pid = pid;
+#endif
+    log_emit("spawn", tag + " pid=" + std::to_string(handle->pid));
     return handle;
 }
 
@@ -272,6 +335,16 @@ std::optional<std::string> TestEnv::hello_call(int sid, bool sticky, int timeout
     std::filesystem::remove(stdout_path, ec);
     std::filesystem::remove(stderr_path, ec);
 
+    std::vector<std::string> args = {
+        "--target", "127.0.0.1:" + std::to_string(ports_.client_leaf_grpc),
+        "--name", "e2e",
+        "--sid", std::to_string(sid),
+        "--sticky", sticky ? "true" : "false",
+        "--count", "1",
+        "--timeout-ms", std::to_string(timeout_ms),
+    };
+
+#ifdef _WIN32
     STARTUPINFOA si{};
     si.cb = sizeof(si);
     si.dwFlags = STARTF_USESTDHANDLES | STARTF_USESHOWWINDOW;
@@ -288,14 +361,6 @@ std::optional<std::string> TestEnv::hello_call(int sid, bool sticky, int timeout
     si.hStdError = err_file;
     si.hStdInput = INVALID_HANDLE_VALUE;
 
-    std::vector<std::string> args = {
-        "--target", "127.0.0.1:" + std::to_string(ports_.client_leaf_grpc),
-        "--name", "e2e",
-        "--sid", std::to_string(sid),
-        "--sticky", sticky ? "true" : "false",
-        "--count", "1",
-        "--timeout-ms", std::to_string(timeout_ms),
-    };
     std::string cmd = build_cmd(hello_client_, args);
 
     PROCESS_INFORMATION pi{};
@@ -314,6 +379,30 @@ std::optional<std::string> TestEnv::hello_call(int sid, bool sticky, int timeout
     ::GetExitCodeProcess(pi.hProcess, &code);
     ::CloseHandle(pi.hThread);
     ::CloseHandle(pi.hProcess);
+#else
+    pid_t pid = fork();
+    if (pid < 0) {
+        err = "fork failed";
+        return std::nullopt;
+    }
+    if (pid == 0) {
+        int fd_out = ::open(stdout_path.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0644);
+        int fd_err = ::open(stderr_path.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0644);
+        if (fd_out >= 0) { ::dup2(fd_out, 1); ::close(fd_out); }
+        if (fd_err >= 0) { ::dup2(fd_err, 2); ::close(fd_err); }
+        std::vector<std::string> argv;
+        argv.reserve(args.size() + 1);
+        argv.push_back(hello_client_);
+        for (const auto& a : args) argv.push_back(a);
+        std::vector<char*> cargv;
+        for (auto& a : argv) cargv.push_back(a.data());
+        cargv.push_back(nullptr);
+        ::execv(hello_client_.c_str(), cargv.data());
+        std::exit(127);
+    }
+    int status = 0;
+    ::waitpid(pid, &status, 0);
+#endif
 
     std::ifstream out(stdout_path);
     std::stringstream ss; ss << out.rdbuf();
@@ -331,9 +420,17 @@ std::optional<std::string> TestEnv::hello_call(int sid, bool sticky, int timeout
 bool TestEnv::kill(const std::string& tag) {
     for (auto& c : children_) {
         if (c->tag == tag) {
+#ifdef _WIN32
             if (c->proc.hProcess) {
                 ::TerminateProcess(c->proc.hProcess, 0);
             }
+#else
+            if (c->pid > 0) {
+                ::kill(c->pid, SIGTERM);
+                int status = 0;
+                ::waitpid(c->pid, &status, 0);
+            }
+#endif
             return true;
         }
     }
@@ -342,6 +439,7 @@ bool TestEnv::kill(const std::string& tag) {
 
 void TestEnv::kill_all() {
     for (auto& c : children_) {
+#ifdef _WIN32
         if (c->proc.hProcess) {
             ::TerminateProcess(c->proc.hProcess, 0);
             ::WaitForSingleObject(c->proc.hProcess, 1500);
@@ -352,6 +450,13 @@ void TestEnv::kill_all() {
             ::CloseHandle(c->job);
             c->job = nullptr;
         }
+#else
+        if (c->pid > 0) {
+            ::kill(c->pid, SIGTERM);
+            int status = 0;
+            ::waitpid(c->pid, &status, 0);
+        }
+#endif
     }
     children_.clear();
 }
