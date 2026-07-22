@@ -48,6 +48,8 @@ struct Peer {
     std::chrono::steady_clock::time_point m_last_recv;
     std::chrono::steady_clock::time_point m_last_heartbeat_sent;
     std::chrono::steady_clock::time_point m_last_handshake_sent;
+    // 握手重发退避（500ms 起步、封顶 5s），进入 Handshake 状态时重置。
+    std::chrono::milliseconds m_handshake_backoff{500};
     std::chrono::steady_clock::time_point m_last_report_sent;
     std::uint32_t m_sequence_out{1};
     // 消息组分 id（fragment 组的 message_id）独立计数器。

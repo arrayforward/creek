@@ -10,6 +10,12 @@ namespace creek {
     return m_impl->handle_metrics(context, request, response);
 }
 
+::grpc::Status AdminService::Directory(::grpc::ServerContext* context,
+                                       const ::creek::v1::DirectoryRequest* request,
+                                       ::creek::v1::DirectoryReply* response) {
+    return m_impl->handle_directory_query(context, request, response);
+}
+
 ::grpc::Status AdminService::SetStickyStrategy(::grpc::ServerContext* context,
                                                const ::creek::v1::StickyStrategyRequest* request,
                                                ::creek::v1::StickyStrategyReply* response) {

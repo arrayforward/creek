@@ -11,6 +11,9 @@ public:
     ::grpc::Status Metrics(::grpc::ServerContext* context,
                            const ::creek::v1::MetricRequest* request,
                            ::creek::v1::MetricReply* response) override;
+    ::grpc::Status Directory(::grpc::ServerContext* context,
+                             const ::creek::v1::DirectoryRequest* request,
+                             ::creek::v1::DirectoryReply* response) override;
     ::grpc::Status SetStickyStrategy(::grpc::ServerContext* context,
                                      const ::creek::v1::StickyStrategyRequest* request,
                                      ::creek::v1::StickyStrategyReply* response) override;

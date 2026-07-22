@@ -19,15 +19,37 @@ public:
     bool merge(const creek::v1::Endpoint& endpoint);
     bool merge(const creek::v1::DirectorySnapshot& snapshot);
     void upsert_local(creek::v1::Endpoint endpoint);
+    // Erase a locally-owned endpoint and leave a tombstone so delayed
+    // snapshots carrying older versions cannot resurrect it. Returns true
+    // when an entry was actually removed.
+    bool remove_local(const std::string& endpoint_id);
+    // Apply a removal tombstone learned from a snapshot: erases the entry
+    // when its version is not newer than the tombstone and records the
+    // tombstone to suppress resurrection by older in-flight snapshots.
+    bool apply_removal(const std::string& endpoint_id, std::uint64_t version,
+                       std::uint64_t updated_ms);
     std::optional<creek::v1::Endpoint> find(std::string_view endpoint_id) const;
     std::vector<creek::v1::Endpoint> service(std::string_view name) const;
     creek::v1::DirectorySnapshot snapshot(std::string_view source_id) const;
+    // Live (unexpired) tombstones as Endpoint shells (endpoint_id/version/
+    // updated_ms), ready for a snapshot's removed_endpoints field.
+    std::vector<creek::v1::Endpoint> tombstones() const;
     std::uint64_t version() const;
     std::size_t size() const;
 
 private:
+    struct Tombstone {
+        std::uint64_t version{};
+        std::uint64_t updated_ms{};
+        std::uint64_t removed_ms{};
+    };
+    // Tombstones ride snapshots and suppress resurrection for this long.
+    // Far beyond any sync interval, short enough to be forgotten.
+    static constexpr std::int64_t kTombstoneTtlMs = 60000;
+
     mutable std::mutex mutex_;
     std::unordered_map<std::string, creek::v1::Endpoint> endpoints_;
+    mutable std::unordered_map<std::string, Tombstone> tombstones_;
     std::uint64_t version_{};
 };
 

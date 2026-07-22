@@ -12,6 +12,8 @@
 #include "creek/rpc/leaf_control_service.hpp"
 #include "creek/rpc/admin_service.hpp"
 
+#include "generic_proxy.hpp"
+
 #include "creek/blocking_queue.hpp"
 #include "creek/circuit_breaker.hpp"
 #include "creek/json_rpc.hpp"
@@ -82,6 +84,48 @@ public:
     grpc::Status invoke_for_hello(const creek::v1::HelloRequest& request,
                                   const Metadata& metadata,
                                   creek::v1::HelloReply* response);
+
+    // ---- generic gRPC proxy (any /pkg.Service/Method, unary + bidi) ----
+    // Sends a wire payload towards a destination leaf/node using the same
+    // parent-selection and direct-connect fallback as send_routed_request.
+    bool send_to_mesh(const std::string& dest_node, const std::string& dest_leaf,
+                      const Bytes& payload, int priority);
+    std::shared_ptr<grpc::Channel> get_channel(const std::string& target);
+    std::string current_node_id();
+    std::shared_ptr<IngressStream> find_stream(const std::string& request_id);
+    void backend_stream_finished(BackendStream* bs, const grpc::Status& status);
+    // Destination leaf: generic unary call to the local backend.
+    void process_inbound_generic(const creek::v1::RoutedRequest& req, std::size_t raw_size);
+    // Ingress leaf: generic completion-queue pump and call lifecycle.
+    void generic_pump();
+    void prime_generic_call();
+    void generic_on_new_call(const std::shared_ptr<IngressStream>& s);
+    void generic_on_read(IngressStream* s, bool ok);
+    void generic_on_write(IngressStream* s, bool ok);
+    void generic_on_finish(IngressStream* s, bool ok);
+    void generic_on_alarm(IngressStream* s, bool ok);
+    void generic_begin_stream(std::shared_ptr<IngressStream> s);
+    // Ingress stream plumbing.
+    void ingress_queue_write(IngressStream* s, std::string bytes);
+    void ingress_try_finish(IngressStream* s);
+    void ingress_teardown(const std::shared_ptr<IngressStream>& s,
+                          const grpc::Status& status);
+    void ingress_forward_frame(IngressStream* s, std::string bytes, bool half_close);
+    void ingress_backend_message(IngressStream* s, std::string bytes);
+    void ingress_backend_closed(IngressStream* s, const grpc::Status& status);
+    void ingress_backend_closed_raw(const std::string& request_id,
+                                    const grpc::Status& status);
+    // Destination-leaf stream side.
+    void stream_worker_loop();
+    void process_stream_open(const creek::v1::RoutedStreamOpen& open);
+    void process_stream_frame(const creek::v1::RoutedStreamFrame& frame);
+    void process_stream_close(const creek::v1::RoutedStreamClose& close);
+    void send_stream_close_to(const std::string& request_id,
+                              const std::string& dest_leaf, const std::string& dest_node,
+                              bool from_origin, std::int32_t status,
+                              const std::string& error);
+    void stream_sweep_loop();
+
     grpc::Status handle_say_hello(::grpc::ServerContext* context,
                                   const ::creek::v1::HelloRequest* request,
                                   ::creek::v1::HelloReply* response);
@@ -97,6 +141,9 @@ public:
     grpc::Status handle_metrics(::grpc::ServerContext* context,
                                 const ::creek::v1::MetricRequest* request,
                                 ::creek::v1::MetricReply* response);
+    grpc::Status handle_directory_query(::grpc::ServerContext* context,
+                                        const ::creek::v1::DirectoryRequest* request,
+                                        ::creek::v1::DirectoryReply* response);
     grpc::Status handle_set_sticky(::grpc::ServerContext* context,
                                    const ::creek::v1::StickyStrategyRequest* request,
                                    ::creek::v1::StickyStrategyReply* response);
@@ -144,6 +191,18 @@ public:
     std::unique_ptr<GreeterService> m_greeter_service;
     std::unique_ptr<LeafControlService> m_leaf_control_service;
     std::unique_ptr<AdminService> m_admin_service;
+    // Generic proxy: catches every method not handled by the typed services.
+    std::unique_ptr<grpc::AsyncGenericService> m_generic_service;
+    std::unique_ptr<grpc::ServerCompletionQueue> m_generic_cq;
+    std::thread m_generic_thread;
+    std::thread m_sweep_thread;
+    // Inbound stream wire messages (open/frame/close) are processed on this
+    // dedicated single worker so per-stream ordering is preserved.
+    std::thread m_stream_worker_thread;
+    BlockingQueue<std::function<void()>> m_stream_queue{1024};
+    std::vector<std::shared_ptr<IngressStream>> m_pending_calls;
+    std::unordered_map<std::string, std::shared_ptr<IngressStream>> m_streams;
+    std::unordered_map<std::string, BackendStream*> m_backend_streams;
     std::thread m_grpc_wait_thread;
     // Worker pool that executes inbound routed requests (backend gRPC calls)
     // off the tight transport's single receiver thread.
@@ -152,6 +211,9 @@ public:
     std::atomic<bool> m_running{false};
     std::mutex m_mutex;
     std::unordered_map<std::string, LocalEndpoint> m_local_endpoints;
+    // Tombstones of locally-removed endpoints: id -> (shell, removed_ms).
+    // Advertised in our snapshots until the TTL expires.
+    std::unordered_map<std::string, std::pair<creek::v1::Endpoint, std::uint64_t>> m_local_tombstones;
     std::unordered_map<std::string, std::shared_ptr<grpc::Channel>> m_channels;
     std::unordered_map<std::string, std::shared_ptr<PendingResponse>> m_pending;
     std::unordered_map<std::string, std::string> m_peer_targets;

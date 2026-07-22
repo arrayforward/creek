@@ -64,6 +64,11 @@ message DirectorySnapshot {
   uint64 version = 2;
   uint64 generated_ms = 3;
   repeated Endpoint endpoints = 4;
+  // Tombstones for endpoints the source authoritatively removed (dead /
+  // deregistered). Only endpoint_id/version/updated_ms are meaningful.
+  // Recipients erase matching entries whose version is not newer and keep
+  // the tombstone briefly so delayed older snapshots cannot resurrect them.
+  repeated Endpoint removed_endpoints = 5;
 }
 
 message RoutedRequest {
@@ -92,11 +97,61 @@ message RoutedResponse {
   uint32 hop_limit = 9;
 }
 
+// Opens a proxied bidi/unary stream. Sent by the ingress (origin) leaf to
+// the leaf that owns the endpoint. rpc_name is the full method path
+// ("/pkg.Service/Method").
+message RoutedStreamOpen {
+  string request_id = 1;
+  string origin_leaf = 2;
+  string origin_node = 3;
+  string destination_leaf = 4;
+  string destination_node = 5;
+  string endpoint_id = 6;
+  string rpc_name = 7;
+  map<string, string> metadata = 8;
+  uint64 deadline_ms = 9;
+  uint32 hop_limit = 10;
+}
+
+// One message frame of a proxied stream. from_origin=true means the frame
+// travels client-side -> backend (ingress leaf -> destination leaf); false
+// means backend -> client. half_close (only meaningful with from_origin)
+// signals the client finished writing (gRPC writes-done).
+message RoutedStreamFrame {
+  string request_id = 1;
+  bytes payload = 2;
+  bool half_close = 3;
+  bool from_origin = 4;
+  string origin_leaf = 5;
+  string origin_node = 6;
+  string destination_leaf = 7;
+  string destination_node = 8;
+  uint32 hop_limit = 9;
+}
+
+// Terminates a proxied stream. from_origin=true: the ingress side cancels
+// (client went away / idle timeout). from_origin=false: the backend call
+// finished; status/error carry the gRPC status code and message.
+message RoutedStreamClose {
+  string request_id = 1;
+  int32 status = 2;
+  string error = 3;
+  bool from_origin = 4;
+  string origin_leaf = 5;
+  string origin_node = 6;
+  string destination_leaf = 7;
+  string destination_node = 8;
+  uint32 hop_limit = 9;
+}
+
 message WireMessage {
   oneof body {
     DirectorySnapshot directory = 1;
     RoutedRequest request = 2;
     RoutedResponse response = 3;
+    RoutedStreamOpen stream_open = 4;
+    RoutedStreamFrame stream_frame = 5;
+    RoutedStreamClose stream_close = 6;
   }
 }
 
@@ -119,8 +174,20 @@ message MetricReply {
   repeated MetricPoint points = 1;
 }
 
+message DirectoryRequest {
+}
+
+// Every endpoint this leaf can currently see (its own local endpoints plus
+// everything learned from node directory broadcasts), dead ones included.
+message DirectoryReply {
+  repeated Endpoint endpoints = 1;
+  string leaf_id = 2;
+  string node_id = 3;
+}
+
 service Admin {
   rpc Metrics(MetricRequest) returns (MetricReply);
+  rpc Directory(DirectoryRequest) returns (DirectoryReply);
   rpc SetStickyStrategy(StickyStrategyRequest) returns (StickyStrategyReply);
   rpc SetBreakerConfig(BreakerConfigRequest) returns (BreakerConfigReply);
   rpc PushWasmModule(PushWasmRequest) returns (PushWasmReply);

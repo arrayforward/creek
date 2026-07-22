@@ -50,6 +50,21 @@ private:
     void handle_response(const std::string& peer_id,
                          const creek::v1::RoutedResponse& resp,
                          std::size_t raw_size);
+    void handle_stream_open(const std::string& peer_id,
+                            const creek::v1::RoutedStreamOpen& open,
+                            std::size_t raw_size);
+    void handle_stream_frame(const std::string& peer_id,
+                             const creek::v1::RoutedStreamFrame& frame,
+                             std::size_t raw_size);
+    void handle_stream_close(const std::string& peer_id,
+                             const creek::v1::RoutedStreamClose& close,
+                             std::size_t raw_size);
+    // Generic destination-based forwarding used by stream frames/closes.
+    // Routes by destination_node/destination_leaf exactly like responses do.
+    void route_stream_frame_locked(const creek::v1::RoutedStreamFrame& frame);
+    void route_stream_close_locked(const creek::v1::RoutedStreamClose& close);
+    void send_stream_close_locked(const creek::v1::RoutedStreamOpen& open,
+                                  const std::string& error);
     void route_request_locked(const std::string& from_peer,
                               const creek::v1::RoutedRequest& req);
     void route_response_locked(const std::string& from_peer,

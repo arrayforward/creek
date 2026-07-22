@@ -403,6 +403,7 @@ public:
         if (peer.m_state == LinkState::Closed) {
             peer.m_state = LinkState::Handshake;
             peer.m_last_handshake_sent = std::chrono::steady_clock::now() - std::chrono::hours(1);
+            peer.m_handshake_backoff = std::chrono::milliseconds(500);
         }
         send_handshake(&peer);
         return true;
@@ -713,6 +714,7 @@ public:
         if (peer->m_state == LinkState::Handshake || peer->m_state == LinkState::Established) {
             send_control(peer, PacketType::Online, Bytes{}, true);
             peer->m_state = LinkState::Online;
+            peer->m_handshake_backoff = std::chrono::milliseconds(500);
             fire_peer_event(peer, LinkState::Online);
             send_speed_test(peer);
         }
@@ -1191,12 +1193,28 @@ public:
 
     void send_handshakes() {
         std::lock_guard<std::mutex> lock(m_peers_mutex);
+        auto now = std::chrono::steady_clock::now();
         for (auto& kv : m_peers) {
             auto& peer = kv.second;
             if (peer.m_state != LinkState::Handshake) continue;
-            if (peer.m_pending.empty()) {
-                send_handshake(&peer);
+            // 握手报文是 ackable 的：对端不在时它永远占据 m_pending（收不到
+            // ACK），旧的 "pending 为空才重发" 判定因此永不重发，leaf 先于
+            // node 启动时握手卡死。重发前清掉陈旧的握手挂账。
+            {
+                std::lock_guard<std::mutex> plk(peer.m_mu);
+                for (auto it = peer.m_pending.begin(); it != peer.m_pending.end();) {
+                    if (it->second.m_header.type == PacketType::Handshake) {
+                        it = peer.m_pending.erase(it);
+                    } else {
+                        ++it;
+                    }
+                }
             }
+            // 指数退避重发：500ms 起步、封顶 5s，对端后启动/重启时持续重试。
+            if (now - peer.m_last_handshake_sent < peer.m_handshake_backoff) continue;
+            send_handshake(&peer);
+            peer.m_handshake_backoff = std::min(peer.m_handshake_backoff * 2,
+                                                std::chrono::milliseconds(5000));
         }
     }
 
@@ -1276,6 +1294,7 @@ public:
                 if (peer.m_reconnect) {
                     peer.m_state = LinkState::Handshake;
                     peer.m_last_handshake_sent = now - m_config.retransmit_timeout;
+                    peer.m_handshake_backoff = std::chrono::milliseconds(500);
                     peer.m_last_recv = now;
                 }
             }

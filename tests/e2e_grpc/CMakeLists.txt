@@ -82,3 +82,70 @@ set_tests_properties(creek_e2e_jsonrpc PROPERTIES
     WORKING_DIRECTORY ${CMAKE_BINARY_DIR}/bin
     ENVIRONMENT "${CREEK_E2E_ENV_PREFIX}CREEK_SIDECAR=$<TARGET_FILE:creek_sidecar>;CREEK_HELLO_SERVER=$<TARGET_FILE:creek_hello_server>;CREEK_E2E_LOG_DIR=${CREEK_E2E_LOG_DIR};CREEK_E2E_TOKEN=test-e2e-token"
 )
+
+# --- generic gRPC proxy e2e (unary + bidi + stickiness) ---------------------
+
+set(CREEK_ECHO_PROTO "${CMAKE_CURRENT_SOURCE_DIR}/echo.proto")
+set(CREEK_ECHO_GENERATED_DIR "${CMAKE_CURRENT_BINARY_DIR}/generated")
+set(CREEK_ECHO_PROTO_SOURCE "${CREEK_ECHO_GENERATED_DIR}/echo.pb.cc")
+set(CREEK_ECHO_GRPC_SOURCE "${CREEK_ECHO_GENERATED_DIR}/echo.grpc.pb.cc")
+
+add_custom_command(
+    OUTPUT "${CREEK_ECHO_PROTO_SOURCE}" "${CREEK_ECHO_GRPC_SOURCE}"
+    COMMAND "${CMAKE_COMMAND}" -E make_directory "${CREEK_ECHO_GENERATED_DIR}"
+    COMMAND "$<TARGET_FILE:protobuf::protoc>"
+        "--proto_path=${CMAKE_CURRENT_SOURCE_DIR}"
+        "--cpp_out=${CREEK_ECHO_GENERATED_DIR}"
+        "--grpc_out=${CREEK_ECHO_GENERATED_DIR}"
+        "--plugin=protoc-gen-grpc=$<TARGET_FILE:gRPC::grpc_cpp_plugin>"
+        "${CREEK_ECHO_PROTO}"
+    DEPENDS "${CREEK_ECHO_PROTO}" protobuf::protoc gRPC::grpc_cpp_plugin
+    VERBATIM
+)
+
+add_library(creek_echo_proto STATIC
+    "${CREEK_ECHO_PROTO_SOURCE}"
+    "${CREEK_ECHO_GRPC_SOURCE}"
+)
+target_include_directories(creek_echo_proto PUBLIC "${CREEK_ECHO_GENERATED_DIR}")
+target_link_libraries(creek_echo_proto PUBLIC creek_proto)
+
+add_executable(creek_echo_backend echo_backend.cpp)
+target_link_libraries(creek_echo_backend PRIVATE creek_echo_proto)
+
+add_executable(creek_e2e_generic
+    e2e_generic_test.cpp
+    e2e_generic_main.cpp
+)
+target_include_directories(creek_e2e_generic PRIVATE ${CMAKE_SOURCE_DIR}/include)
+target_link_libraries(creek_e2e_generic PRIVATE creek_core creek_echo_proto GTest::gtest)
+add_test(
+    NAME creek_e2e_generic
+    COMMAND "$<TARGET_FILE:creek_e2e_generic>"
+)
+set_tests_properties(creek_e2e_generic PROPERTIES
+    TIMEOUT 300
+    RUN_SERIAL TRUE
+    WORKING_DIRECTORY ${CMAKE_BINARY_DIR}/bin
+    ENVIRONMENT "${CREEK_E2E_ENV_PREFIX}CREEK_SIDECAR=$<TARGET_FILE:creek_sidecar>;CREEK_ECHO_BACKEND=$<TARGET_FILE:creek_echo_backend>;CREEK_REGISTRAR=$<TARGET_FILE:creek_registrar>;CREEK_E2E_LOG_DIR=${CREEK_E2E_LOG_DIR};CREEK_E2E_TOKEN=test-e2e-token"
+)
+
+# --- hardening e2e (mount retry, dead-endpoint removal, admin directory,
+#     server-streaming through the mesh). 33xxx ports only. -----------------
+
+add_executable(creek_e2e_hardening
+    e2e_hardening_test.cpp
+    e2e_hardening_main.cpp
+)
+target_include_directories(creek_e2e_hardening PRIVATE ${CMAKE_SOURCE_DIR}/include)
+target_link_libraries(creek_e2e_hardening PRIVATE creek_core creek_echo_proto GTest::gtest)
+add_test(
+    NAME creek_e2e_hardening
+    COMMAND "$<TARGET_FILE:creek_e2e_hardening>"
+)
+set_tests_properties(creek_e2e_hardening PROPERTIES
+    TIMEOUT 300
+    RUN_SERIAL TRUE
+    WORKING_DIRECTORY ${CMAKE_BINARY_DIR}/bin
+    ENVIRONMENT "${CREEK_E2E_ENV_PREFIX}CREEK_SIDECAR=$<TARGET_FILE:creek_sidecar>;CREEK_ECHO_BACKEND=$<TARGET_FILE:creek_echo_backend>;CREEK_REGISTRAR=$<TARGET_FILE:creek_registrar>;CREEK_ADMIN_CLIENT=$<TARGET_FILE:creek_admin_client>;CREEK_E2E_LOG_DIR=${CREEK_E2E_LOG_DIR};CREEK_E2E_TOKEN=test-e2e-token"
+)

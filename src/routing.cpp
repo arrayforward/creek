@@ -17,6 +17,10 @@ namespace creek {
 bool EndpointDirectory::merge(const creek::v1::Endpoint& endpoint) {
     if (endpoint.endpoint_id().empty()) return false;
     std::lock_guard<std::mutex> lock(mutex_);
+    auto ts = tombstones_.find(endpoint.endpoint_id());
+    if (ts != tombstones_.end() && endpoint.version() <= ts->second.version) {
+        return false;
+    }
     auto it = endpoints_.find(endpoint.endpoint_id());
     if (it == endpoints_.end()) {
         endpoints_.emplace(endpoint.endpoint_id(), endpoint);
@@ -43,12 +47,20 @@ bool EndpointDirectory::merge(const creek::v1::DirectorySnapshot& snapshot) {
     for (const auto& ep : snapshot.endpoints()) {
         if (merge(ep)) changed = true;
     }
+    for (const auto& removed : snapshot.removed_endpoints()) {
+        if (apply_removal(removed.endpoint_id(), removed.version(),
+                          removed.updated_ms())) {
+            changed = true;
+        }
+    }
     return changed;
 }
 
 void EndpointDirectory::upsert_local(creek::v1::Endpoint endpoint) {
     if (endpoint.endpoint_id().empty()) return;
     std::lock_guard<std::mutex> lock(mutex_);
+    // A local upsert is authoritative: clear any tombstone for this id.
+    tombstones_.erase(endpoint.endpoint_id());
     auto it = endpoints_.find(endpoint.endpoint_id());
     if (it == endpoints_.end()) {
         if (endpoint.version() == 0) endpoint.set_version(1);
@@ -63,6 +75,36 @@ void EndpointDirectory::upsert_local(creek::v1::Endpoint endpoint) {
     }
     endpoints_[endpoint.endpoint_id()] = std::move(endpoint);
     ++version_;
+}
+
+bool EndpointDirectory::remove_local(const std::string& endpoint_id) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    auto it = endpoints_.find(endpoint_id);
+    if (it == endpoints_.end()) return false;
+    Tombstone ts{it->second.version(), it->second.updated_ms(), creek::unix_millis()};
+    endpoints_.erase(it);
+    tombstones_[endpoint_id] = ts;
+    ++version_;
+    return true;
+}
+
+bool EndpointDirectory::apply_removal(const std::string& endpoint_id,
+                                      std::uint64_t version,
+                                      std::uint64_t updated_ms) {
+    if (endpoint_id.empty()) return false;
+    std::lock_guard<std::mutex> lock(mutex_);
+    bool changed = false;
+    auto it = endpoints_.find(endpoint_id);
+    if (it != endpoints_.end() && it->second.version() <= version) {
+        endpoints_.erase(it);
+        ++version_;
+        changed = true;
+    }
+    auto ts = tombstones_.find(endpoint_id);
+    if (ts == tombstones_.end() || ts->second.version < version) {
+        tombstones_[endpoint_id] = Tombstone{version, updated_ms, creek::unix_millis()};
+    }
+    return changed;
 }
 
 std::optional<creek::v1::Endpoint> EndpointDirectory::find(std::string_view endpoint_id) const {
@@ -92,7 +134,36 @@ creek::v1::DirectorySnapshot EndpointDirectory::snapshot(std::string_view source
     for (const auto& kv : endpoints_) {
         *snap.add_endpoints() = kv.second;
     }
+    const auto now = creek::unix_millis();
+    for (auto it = tombstones_.begin(); it != tombstones_.end();) {
+        if (now - it->second.removed_ms >= static_cast<std::uint64_t>(kTombstoneTtlMs)) {
+            it = tombstones_.erase(it);
+            continue;
+        }
+        auto* removed = snap.add_removed_endpoints();
+        removed->set_endpoint_id(it->first);
+        removed->set_version(it->second.version);
+        removed->set_updated_ms(it->second.updated_ms);
+        ++it;
+    }
     return snap;
+}
+
+std::vector<creek::v1::Endpoint> EndpointDirectory::tombstones() const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    std::vector<creek::v1::Endpoint> out;
+    const auto now = creek::unix_millis();
+    for (const auto& kv : tombstones_) {
+        if (now - kv.second.removed_ms >= static_cast<std::uint64_t>(kTombstoneTtlMs)) {
+            continue;
+        }
+        creek::v1::Endpoint removed;
+        removed.set_endpoint_id(kv.first);
+        removed.set_version(kv.second.version);
+        removed.set_updated_ms(kv.second.updated_ms);
+        out.push_back(std::move(removed));
+    }
+    return out;
 }
 
 std::uint64_t EndpointDirectory::version() const {

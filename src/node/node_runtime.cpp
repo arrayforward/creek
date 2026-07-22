@@ -135,6 +135,12 @@ framework::ChangeSet NodeRuntime::Impl::process_batch(const std::vector<framewor
                     handle_request(msg.source, wm.request(), msg.payload.size());
                 } else if (wm.has_response()) {
                     handle_response(msg.source, wm.response(), msg.payload.size());
+                } else if (wm.has_stream_open()) {
+                    handle_stream_open(msg.source, wm.stream_open(), msg.payload.size());
+                } else if (wm.has_stream_frame()) {
+                    handle_stream_frame(msg.source, wm.stream_frame(), msg.payload.size());
+                } else if (wm.has_stream_close()) {
+                    handle_stream_close(msg.source, wm.stream_close(), msg.payload.size());
                 }
             }
         } else if (msg.kind == framework::MessageKind::PeerEvent) {
@@ -182,6 +188,12 @@ void NodeRuntime::Impl::on_message(const std::string& peer_id, Bytes payload) {
         handle_request(peer_id, msg.request(), payload.size());
     } else if (msg.has_response()) {
         handle_response(peer_id, msg.response(), payload.size());
+    } else if (msg.has_stream_open()) {
+        handle_stream_open(peer_id, msg.stream_open(), payload.size());
+    } else if (msg.has_stream_frame()) {
+        handle_stream_frame(peer_id, msg.stream_frame(), payload.size());
+    } else if (msg.has_stream_close()) {
+        handle_stream_close(peer_id, msg.stream_close(), payload.size());
     }
 }
 
@@ -215,6 +227,22 @@ void NodeRuntime::Impl::handle_directory(const std::string& peer_id,
                 ep.set_version(++m_version_counter);
                 ep.set_updated_ms(unix_millis());
                 new_leaf_eps.insert(ep.endpoint_id());
+            }
+        }
+        // The leaf's snapshot is authoritative for its own endpoints: ids
+        // that vanished since the previous snapshot were removed on the
+        // leaf (dead past the grace period / deregistered). Erase them here
+        // with a fresh tombstone so our broadcasts propagate the removal
+        // and delayed older snapshots cannot resurrect them.
+        auto prev_it = m_leaf_endpoints.find(peer_id);
+        if (prev_it != m_leaf_endpoints.end()) {
+            for (const auto& old_id : prev_it->second) {
+                if (new_leaf_eps.count(old_id) == 0) {
+                    auto* removed = to_merge.add_removed_endpoints();
+                    removed->set_endpoint_id(old_id);
+                    removed->set_version(++m_version_counter);
+                    removed->set_updated_ms(unix_millis());
+                }
             }
         }
         m_leaf_endpoints[peer_id] = std::move(new_leaf_eps);
@@ -306,8 +334,150 @@ void NodeRuntime::Impl::route_request_locked(const std::string& from_peer,
                   request_metadata(fwd));
 }
 
+void NodeRuntime::Impl::handle_stream_open(const std::string& peer_id,
+                                           const creek::v1::RoutedStreamOpen& open,
+                                           std::size_t raw_size) {
+    bool from_leaf = false;
+    {
+        std::lock_guard<std::mutex> lk(m_mutex);
+        auto leaf_it = m_leaves.find(peer_id);
+        if (leaf_it != m_leaves.end()) {
+            leaf_it->second = SteadyClock::now();
+            from_leaf = true;
+        }
+        const std::string dest_node = open.destination_node();
+        const std::string dest_leaf = open.destination_leaf();
+        if (dest_node.empty() || dest_node == m_config.id) {
+            auto dest_it = m_leaves.find(dest_leaf);
+            if (dest_it == m_leaves.end()) {
+                send_stream_close_locked(open, "leaf_not_found");
+            } else {
+                creek::v1::RoutedStreamOpen fwd = open;
+                fwd.set_destination_node(m_config.id);
+                creek::v1::WireMessage wm;
+                *wm.mutable_stream_open() = fwd;
+                Bytes payload = serialize_wire(wm);
+                m_transport->send(dest_leaf, payload);
+                record_metric("node_to_leaf", "RoutedStreamOpen", payload.size(), 0, true);
+            }
+        } else {
+            if (open.hop_limit() == 0) {
+                send_stream_close_locked(open, "hop_limit_exceeded");
+            } else if (!m_known_node_peers.count(dest_node)) {
+                send_stream_close_locked(open, "node_not_found");
+            } else {
+                creek::v1::RoutedStreamOpen fwd = open;
+                fwd.set_hop_limit(open.hop_limit() - 1);
+                creek::v1::WireMessage wm;
+                *wm.mutable_stream_open() = fwd;
+                Bytes payload = serialize_wire(wm);
+                m_transport->send(dest_node, payload);
+                record_metric("node_to_node", "RoutedStreamOpen", payload.size(), 0, true);
+            }
+        }
+    }
+    record_metric(from_leaf ? "leaf_to_node" : "node_to_node",
+                  open.rpc_name(), raw_size, 0, true);
+}
+
+void NodeRuntime::Impl::handle_stream_frame(const std::string& peer_id,
+                                            const creek::v1::RoutedStreamFrame& frame,
+                                            std::size_t raw_size) {
+    {
+        std::lock_guard<std::mutex> lk(m_mutex);
+        auto leaf_it = m_leaves.find(peer_id);
+        if (leaf_it != m_leaves.end()) {
+            leaf_it->second = SteadyClock::now();
+        }
+        route_stream_frame_locked(frame);
+    }
+    record_metric("node_to_node", "RoutedStreamFrame", raw_size, 0, true);
+}
+
+void NodeRuntime::Impl::handle_stream_close(const std::string& peer_id,
+                                            const creek::v1::RoutedStreamClose& close,
+                                            std::size_t raw_size) {
+    {
+        std::lock_guard<std::mutex> lk(m_mutex);
+        auto leaf_it = m_leaves.find(peer_id);
+        if (leaf_it != m_leaves.end()) {
+            leaf_it->second = SteadyClock::now();
+        }
+        route_stream_close_locked(close);
+    }
+    record_metric("node_to_node", "RoutedStreamClose", raw_size, 0, true);
+}
+
+void NodeRuntime::Impl::route_stream_frame_locked(const creek::v1::RoutedStreamFrame& frame) {
+    const std::string dest_node = frame.destination_node();
+    const std::string dest_leaf = frame.destination_leaf();
+    if (dest_node.empty() || dest_node == m_config.id) {
+        auto leaf_it = m_leaves.find(dest_leaf);
+        if (leaf_it == m_leaves.end()) return;
+        creek::v1::RoutedStreamFrame out = frame;
+        out.set_destination_node(m_config.id);
+        creek::v1::WireMessage wm;
+        *wm.mutable_stream_frame() = out;
+        Bytes payload = serialize_wire(wm);
+        m_transport->send(dest_leaf, payload);
+        record_metric("node_to_leaf", "RoutedStreamFrame", payload.size(), 0, true);
+        return;
+    }
+    if (frame.hop_limit() == 0) return;
+    if (!m_known_node_peers.count(dest_node)) return;
+    creek::v1::RoutedStreamFrame fwd = frame;
+    fwd.set_hop_limit(frame.hop_limit() - 1);
+    creek::v1::WireMessage wm;
+    *wm.mutable_stream_frame() = fwd;
+    Bytes payload = serialize_wire(wm);
+    m_transport->send(dest_node, payload);
+    record_metric("node_to_node", "RoutedStreamFrame", payload.size(), 0, true);
+}
+
+void NodeRuntime::Impl::route_stream_close_locked(const creek::v1::RoutedStreamClose& close) {
+    const std::string dest_node = close.destination_node();
+    const std::string dest_leaf = close.destination_leaf();
+    if (dest_node.empty() || dest_node == m_config.id) {
+        auto leaf_it = m_leaves.find(dest_leaf);
+        if (leaf_it == m_leaves.end()) return;
+        creek::v1::RoutedStreamClose out = close;
+        out.set_destination_node(m_config.id);
+        creek::v1::WireMessage wm;
+        *wm.mutable_stream_close() = out;
+        Bytes payload = serialize_wire(wm);
+        m_transport->send(dest_leaf, payload);
+        record_metric("node_to_leaf", "RoutedStreamClose", payload.size(), 0, true);
+        return;
+    }
+    if (close.hop_limit() == 0) return;
+    if (!m_known_node_peers.count(dest_node)) return;
+    creek::v1::RoutedStreamClose fwd = close;
+    fwd.set_hop_limit(close.hop_limit() - 1);
+    creek::v1::WireMessage wm;
+    *wm.mutable_stream_close() = fwd;
+    Bytes payload = serialize_wire(wm);
+    m_transport->send(dest_node, payload);
+    record_metric("node_to_node", "RoutedStreamClose", payload.size(), 0, true);
+}
+
+void NodeRuntime::Impl::send_stream_close_locked(const creek::v1::RoutedStreamOpen& open,
+                                                 const std::string& error) {
+    creek::v1::RoutedStreamClose close;
+    close.set_request_id(open.request_id());
+    close.set_status(-1);
+    close.set_error(error);
+    close.set_from_origin(false);
+    close.set_origin_leaf(open.destination_leaf());
+    close.set_origin_node(open.destination_node());
+    close.set_destination_leaf(open.origin_leaf());
+    close.set_destination_node(open.origin_node());
+    close.set_hop_limit(open.hop_limit() > 0 ? open.hop_limit() - 1 : 0);
+    route_stream_close_locked(close);
+}
+
 void NodeRuntime::Impl::route_response_locked(const std::string& from_peer,
                                               const creek::v1::RoutedResponse& resp) {
+    (void)from_peer;
     const std::string dest_node = resp.destination_node();
     const std::string dest_leaf = resp.destination_leaf();
     if (dest_node.empty() || dest_node == m_config.id) {

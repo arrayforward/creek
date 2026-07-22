@@ -20,6 +20,20 @@
 
 namespace creek {
 
+namespace {
+
+// Backend heartbeat ages: at kEndpointDeadMs the endpoint is marked
+// alive=false (routing already skips it); at kEndpointRemoveMs it is
+// dropped from the local directory and the removal is broadcast so the
+// whole cluster converges. The gap lets a briefly-flapping backend revive
+// or re-register without the endpoint ever disappearing from directories.
+constexpr std::int64_t kEndpointDeadMs = 3000;
+constexpr std::int64_t kEndpointRemoveMs = 10000;
+// Locally-removed endpoint tombstones ride our snapshots for this long.
+constexpr std::uint64_t kLocalTombstoneTtlMs = 60000;
+
+}
+
 LeafRuntime::Impl::Impl(LeafConfig config)
     : m_config(std::move(config)),
       m_balancer(4096, std::chrono::minutes(1)),
@@ -127,6 +141,7 @@ bool LeafRuntime::Impl::start() {
     m_greeter_service = std::make_unique<GreeterService>(this);
     m_leaf_control_service = std::make_unique<LeafControlService>(this);
     m_admin_service = std::make_unique<AdminService>(this);
+    m_generic_service = std::make_unique<grpc::AsyncGenericService>();
 
     grpc::ServerBuilder builder;
     CREEK_LOG_INFO(std::string("[runtime] building gRPC server on ") + format_address(m_config.grpc_bind));
@@ -135,6 +150,8 @@ bool LeafRuntime::Impl::start() {
     builder.RegisterService(m_greeter_service.get());
     builder.RegisterService(m_leaf_control_service.get());
     builder.RegisterService(m_admin_service.get());
+    builder.RegisterAsyncGenericService(m_generic_service.get());
+    m_generic_cq = builder.AddCompletionQueue();
     grpc::reflection::InitProtoReflectionServerBuilderPlugin();
     CREEK_LOG_INFO("[runtime] calling BuildAndStart...");
     m_grpc_server = builder.BuildAndStart();
@@ -155,6 +172,9 @@ bool LeafRuntime::Impl::start() {
     m_grpc_wait_thread = std::thread([this] {
         if (m_grpc_server) m_grpc_server->Wait();
     });
+    m_generic_thread = std::thread([this] { generic_pump(); });
+    m_sweep_thread = std::thread([this] { stream_sweep_loop(); });
+    m_stream_worker_thread = std::thread([this] { stream_worker_loop(); });
     // A handful of workers is plenty: routed calls are infrequent and the
     // queue absorbs bursts. Each worker blocks on backend gRPC calls so
     // the transport receiver thread never has to.
@@ -185,14 +205,49 @@ bool LeafRuntime::Impl::start() {
 void LeafRuntime::Impl::stop() {
     if (!m_running.exchange(false)) return;
     m_request_queue.close();
+    m_stream_queue.close();
     for (auto& t : m_worker_threads) {
         if (t.joinable()) t.join();
     }
     m_worker_threads.clear();
+    if (m_stream_worker_thread.joinable()) m_stream_worker_thread.join();
+    // Cancel all in-flight proxied streams so their pumps drain quickly.
+    {
+        std::lock_guard<std::mutex> lk(m_mutex);
+        for (auto& kv : m_streams) {
+            std::lock_guard<std::mutex> sl(kv.second->m);
+            if (!kv.second->dead && !kv.second->finishing) kv.second->ctx.TryCancel();
+        }
+        for (auto& kv : m_backend_streams) {
+            kv.second->cancel();
+        }
+    }
     if (m_grpc_server) {
         m_grpc_server->Shutdown(std::chrono::system_clock::now() + std::chrono::seconds(2));
     }
+    // ServerBuilder::AddCompletionQueue queues are NOT shut down by
+    // Server::Shutdown; without this the generic pump never sees Next
+    // return false and the join below hangs forever.
+    if (m_generic_cq) {
+        m_generic_cq->Shutdown();
+    }
     if (m_grpc_wait_thread.joinable()) m_grpc_wait_thread.join();
+    if (m_generic_thread.joinable()) m_generic_thread.join();
+    if (m_sweep_thread.joinable()) m_sweep_thread.join();
+    // Backend stream pump threads self-delete; wait briefly for the registry
+    // to drain so no pump outlives the impl.
+    for (int i = 0; i < 40; ++i) {
+        {
+            std::lock_guard<std::mutex> lk(m_mutex);
+            if (m_backend_streams.empty()) break;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    }
+    {
+        std::lock_guard<std::mutex> lk(m_mutex);
+        m_streams.clear();
+        m_pending_calls.clear();
+    }
     if (m_framework) {
         if (m_heartbeat_task_id != 0) {
             m_framework->reactor().cancel_periodic(m_heartbeat_task_id);
@@ -217,6 +272,8 @@ void LeafRuntime::Impl::stop() {
     m_greeter_service.reset();
     m_leaf_control_service.reset();
     m_admin_service.reset();
+    m_generic_service.reset();
+    m_generic_cq.reset();
     m_redis.reset();
 
     std::lock_guard<std::mutex> lk(m_mutex);
@@ -228,6 +285,7 @@ void LeafRuntime::Impl::stop() {
     m_pending.clear();
     m_channels.clear();
     m_local_endpoints.clear();
+    m_local_tombstones.clear();
 }
 
 void LeafRuntime::Impl::on_message(const std::string& peer_id, Bytes payload) {
@@ -244,20 +302,35 @@ void LeafRuntime::Impl::on_message(const std::string& peer_id, Bytes payload) {
         handle_inbound_request(msg.request(), payload.size());
     } else if (msg.has_response()) {
         handle_inbound_response(msg.response(), payload.size());
+    } else if (msg.has_stream_open()) {
+        creek::v1::RoutedStreamOpen open = msg.stream_open();
+        if (!m_stream_queue.try_push([this, open] { process_stream_open(open); })) {
+            send_stream_close_to(open.request_id(), open.origin_leaf(),
+                                 open.origin_node(), false, -1, "overloaded");
+        }
+    } else if (msg.has_stream_frame()) {
+        creek::v1::RoutedStreamFrame frame = msg.stream_frame();
+        m_stream_queue.try_push([this, frame] { process_stream_frame(frame); });
+    } else if (msg.has_stream_close()) {
+        creek::v1::RoutedStreamClose close = msg.stream_close();
+        m_stream_queue.try_push([this, close] { process_stream_close(close); });
     }
 }
 
 void LeafRuntime::Impl::on_peer_event(const PeerEvent& ev) {
-    std::lock_guard<std::mutex> lk(m_mutex);
-    CREEK_LOG_INFO(std::string("[runtime] leaf on_peer_event id=") + ev.id + " state=" + std::to_string((int)ev.state) +
-                   " in_parents=" + std::to_string(m_parent_ids.count(ev.id)));
-    if (!m_parent_ids.count(ev.id)) return;
-    if (ev.state == LinkState::Online) {
-        if (m_active_parent.empty()) {
-            m_active_parent = ev.id;
-            m_all_parents_down.store(false);
-        }
-    } else if (ev.state == LinkState::Closed) {
+    bool send_snap = false;
+    {
+        std::lock_guard<std::mutex> lk(m_mutex);
+        CREEK_LOG_INFO(std::string("[runtime] leaf on_peer_event id=") + ev.id + " state=" + std::to_string((int)ev.state) +
+                       " in_parents=" + std::to_string(m_parent_ids.count(ev.id)));
+        if (!m_parent_ids.count(ev.id)) return;
+        if (ev.state == LinkState::Online) {
+            if (m_active_parent.empty()) {
+                m_active_parent = ev.id;
+                m_all_parents_down.store(false);
+                send_snap = true;
+            }
+        } else if (ev.state == LinkState::Closed) {
         if (ev.id == m_active_parent) {
             m_active_parent.clear();
             bool found = false;
@@ -278,6 +351,11 @@ void LeafRuntime::Impl::on_peer_event(const PeerEvent& ev) {
             }
         }
     }
+    }
+    // Handshake (re)completed: push our directory immediately so a
+    // late-started/restarted node mounts this leaf without waiting for the
+    // next sync tick.
+    if (send_snap) send_snapshot_to_parent();
 }
 
 void LeafRuntime::Impl::handle_directory(const creek::v1::DirectorySnapshot& snap, std::size_t raw_size) {
@@ -325,6 +403,13 @@ void LeafRuntime::Impl::process_inbound_request(const creek::v1::RoutedRequest& 
     if (req.destination_leaf() != m_config.id) {
         creek::v1::RoutedResponse resp = make_error_response(req, "wrong_destination_leaf");
         send_response_to_parent(resp);
+        return;
+    }
+
+    // Generic proxy path: a full method path ("/pkg.Service/Method") is
+    // answered with a raw-bytes generic unary call instead of Greeter.
+    if (!req.rpc_name().empty() && req.rpc_name().front() == '/') {
+        process_inbound_generic(req, raw_size);
         return;
     }
 
@@ -465,18 +550,7 @@ grpc::Status LeafRuntime::Impl::call_backend(const creek::v1::Endpoint& ep,
 }
 
 std::unique_ptr<creek::v1::Greeter::Stub> LeafRuntime::Impl::get_stub(const std::string& target) {
-    std::shared_ptr<grpc::Channel> channel;
-    {
-        std::lock_guard<std::mutex> lk(m_mutex);
-        auto it = m_channels.find(target);
-        if (it == m_channels.end()) {
-            channel = grpc::CreateChannel(target, grpc::InsecureChannelCredentials());
-            m_channels[target] = channel;
-        } else {
-            channel = it->second;
-        }
-    }
-    return creek::v1::Greeter::NewStub(channel);
+    return creek::v1::Greeter::NewStub(get_channel(target));
 }
 
 grpc::Status LeafRuntime::Impl::send_routed_request(const creek::v1::Endpoint& ep,
@@ -515,44 +589,7 @@ grpc::Status LeafRuntime::Impl::send_routed_request(const creek::v1::Endpoint& e
     *wm.mutable_request() = out;
     Bytes payload = serialize_wire(wm);
     auto send_start = SteadyClock::now();
-    bool sent = false;
-    {
-        std::lock_guard<std::mutex> lk(m_mutex);
-        if (!m_active_parent.empty()) {
-            sent = m_transport->send_priority(m_active_parent, payload, 1);
-        }
-        if (!sent) {
-            for (const auto& pid : m_parent_ids) {
-                if (pid == m_active_parent) continue;
-                sent = m_transport->send_priority(pid, payload, 1);
-                if (sent) break;
-            }
-        }
-    }
-    if (!sent) {
-        std::string target_addr;
-        std::string target_id;
-        {
-            std::lock_guard<std::mutex> lk(m_mutex);
-            if (m_peer_targets.count(out.destination_node())) {
-                target_addr = m_peer_targets[out.destination_node()];
-                target_id = out.destination_node();
-            } else {
-                auto it = m_known_leaves.find(out.destination_leaf());
-                if (it != m_known_leaves.end()) {
-                    target_addr = format_address(it->second);
-                    target_id = out.destination_node();
-                }
-            }
-        }
-        if (!target_addr.empty()) {
-            auto parsed = parse_address(target_addr);
-            if (parsed) {
-                m_transport->connect({target_id, to_tight_address(*parsed)});
-                sent = m_transport->send_priority(target_id, payload, 1);
-            }
-        }
-    }
+    bool sent = send_to_mesh(out.destination_node(), out.destination_leaf(), payload, 1);
     CREEK_LOG_DEBUG(std::string("[creek-leaf] send_routed rid=")
                      + out.request_id()
                      + " dest_node=" + out.destination_node()
@@ -827,6 +864,7 @@ grpc::Status LeafRuntime::Impl::handle_register(::grpc::ServerContext* context,
         std::lock_guard<std::mutex> lk(m_mutex);
         m_directory.upsert_local(ep);
         m_local_endpoints[ep.endpoint_id()] = LocalEndpoint{ep, SteadyClock::now()};
+        m_local_tombstones.erase(ep.endpoint_id());
         CREEK_LOG_DEBUG(std::string("[creek-leaf] register local_eps_count=") + std::to_string(m_local_endpoints.size()));
     }
     CREEK_LOG_DEBUG(std::string("[creek-leaf] register ep=")
@@ -855,6 +893,7 @@ grpc::Status LeafRuntime::Impl::handle_heartbeat(::grpc::ServerContext* context,
             it->second.endpoint.set_version(++m_version_counter);
             it->second.endpoint.set_updated_ms(unix_millis());
             m_directory.upsert_local(it->second.endpoint);
+            m_local_tombstones.erase(request->endpoint_id());
             revived = true;
         }
     }
@@ -892,6 +931,19 @@ grpc::Status LeafRuntime::Impl::handle_metrics(::grpc::ServerContext* context,
     (void)context;
     if (!m_metrics_store) return grpc::Status(grpc::StatusCode::UNAVAILABLE, "no_store");
     *response = m_metrics_store->protobuf_snapshot(request->previous_minute(), request->take());
+    return grpc::Status::OK;
+}
+
+grpc::Status LeafRuntime::Impl::handle_directory_query(::grpc::ServerContext* context,
+                                                       const ::creek::v1::DirectoryRequest* request,
+                                                       ::creek::v1::DirectoryReply* response) {
+    (void)context;
+    (void)request;
+    response->set_leaf_id(m_config.id);
+    response->set_node_id(current_node_id());
+    std::lock_guard<std::mutex> lk(m_mutex);
+    auto snap = m_directory.snapshot(m_config.id);
+    *response->mutable_endpoints() = std::move(*snap.mutable_endpoints());
     return grpc::Status::OK;
 }
 
@@ -982,6 +1034,17 @@ void LeafRuntime::Impl::send_snapshot_to_parent() {
         for (auto& kv : m_local_endpoints) {
             *snap.add_endpoints() = kv.second.endpoint;
         }
+        // Advertise removals of OUR endpoints only (tombstones learned from
+        // the mesh are not ours to re-broadcast). Prune after the TTL.
+        const auto now_ms = unix_millis();
+        for (auto it = m_local_tombstones.begin(); it != m_local_tombstones.end();) {
+            if (now_ms - it->second.second >= kLocalTombstoneTtlMs) {
+                it = m_local_tombstones.erase(it);
+                continue;
+            }
+            *snap.add_removed_endpoints() = it->second.first;
+            ++it;
+        }
     }
     creek::v1::WireMessage wm;
     *wm.mutable_directory() = snap;
@@ -998,23 +1061,41 @@ void LeafRuntime::Impl::send_snapshot_to_parent() {
 void LeafRuntime::Impl::do_heartbeat_work() {
     auto now = SteadyClock::now();
     std::vector<creek::v1::Endpoint> dead;
+    bool removed_any = false;
     {
         std::lock_guard<std::mutex> lk(m_mutex);
-        for (auto& kv : m_local_endpoints) {
+        for (auto it = m_local_endpoints.begin(); it != m_local_endpoints.end();) {
             auto age = std::chrono::duration_cast<std::chrono::milliseconds>(
-                now - kv.second.last_heartbeat).count();
-            if (age >= 3000 && kv.second.endpoint.alive()) {
-                kv.second.endpoint.set_alive(false);
-                kv.second.endpoint.set_version(++m_version_counter);
-                kv.second.endpoint.set_updated_ms(unix_millis());
-                dead.push_back(kv.second.endpoint);
+                now - it->second.last_heartbeat).count();
+            if (age >= kEndpointRemoveMs) {
+                // Dead past the grace period: drop from the local directory
+                // and advertise the removal (tombstone) in our snapshots.
+                creek::v1::Endpoint tomb = it->second.endpoint;
+                if (m_directory.remove_local(it->first)) {
+                    removed_any = true;
+                    creek::v1::Endpoint removed;
+                    removed.set_endpoint_id(tomb.endpoint_id());
+                    removed.set_version(tomb.version());
+                    removed.set_updated_ms(tomb.updated_ms());
+                    m_local_tombstones[it->first] = {std::move(removed), unix_millis()};
+                    CREEK_LOG_INFO(std::string("[creek-leaf] endpoint removed ep=") + tomb.endpoint_id());
+                }
+                it = m_local_endpoints.erase(it);
+                continue;
             }
+            if (age >= kEndpointDeadMs && it->second.endpoint.alive()) {
+                it->second.endpoint.set_alive(false);
+                it->second.endpoint.set_version(++m_version_counter);
+                it->second.endpoint.set_updated_ms(unix_millis());
+                dead.push_back(it->second.endpoint);
+            }
+            ++it;
         }
         for (auto& ep : dead) {
             m_directory.upsert_local(ep);
         }
     }
-    if (!dead.empty()) {
+    if (!dead.empty() || removed_any) {
         send_snapshot_to_parent();
     }
 }
@@ -1092,6 +1173,18 @@ framework::ChangeSet LeafRuntime::Impl::process_batch(const std::vector<framewor
                     handle_inbound_request(wm.request(), msg.payload.size());
                 } else if (wm.has_response()) {
                     handle_inbound_response(wm.response(), msg.payload.size());
+                } else if (wm.has_stream_open()) {
+                    creek::v1::RoutedStreamOpen open = wm.stream_open();
+                    if (!m_stream_queue.try_push([this, open] { process_stream_open(open); })) {
+                        send_stream_close_to(open.request_id(), open.origin_leaf(),
+                                             open.origin_node(), false, -1, "overloaded");
+                    }
+                } else if (wm.has_stream_frame()) {
+                    creek::v1::RoutedStreamFrame frame = wm.stream_frame();
+                    m_stream_queue.try_push([this, frame] { process_stream_frame(frame); });
+                } else if (wm.has_stream_close()) {
+                    creek::v1::RoutedStreamClose close = wm.stream_close();
+                    m_stream_queue.try_push([this, close] { process_stream_close(close); });
                 }
             }
         } else if (msg.kind == framework::MessageKind::PeerEvent) {

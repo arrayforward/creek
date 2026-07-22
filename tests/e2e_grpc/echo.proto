@@ -1,0 +1,25 @@
+syntax = "proto3";
+
+package creek.test;
+
+message EchoRequest {
+  string text = 1;
+  uint32 seq = 2;
+}
+
+message EchoReply {
+  string text = 1;
+  string backend_id = 2;
+  uint32 seq = 3;
+}
+
+// Test service for the generic gRPC proxy: one unary method, one bidi
+// streaming method and one server-streaming method, deliberately NOT the
+// Greeter service.
+service Echo {
+  rpc Echo(EchoRequest) returns (EchoReply);
+  rpc Chat(stream EchoRequest) returns (stream EchoReply);
+  // Server-streaming: replies seq times ("echo:<text>#i", seq=i). Exercises
+  // the one-request-then-half-close path through the mesh.
+  rpc Count(EchoRequest) returns (stream EchoReply);
+}

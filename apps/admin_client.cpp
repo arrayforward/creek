@@ -2,6 +2,7 @@
 
 #include <grpcpp/grpcpp.h>
 
+#include <cstdio>
 #include <fstream>
 #include <iostream>
 #include <sstream>
@@ -101,8 +102,31 @@ int unload_wasm(const std::string& target, uint32_t module_id) {
     return 0;
 }
 
-int metrics(const std::string& target) {
+int directory(const std::string& target) {
     auto channel = grpc::CreateChannel(target, grpc::InsecureChannelCredentials());
+    auto stub = creek::v1::Admin::NewStub(channel);
+    creek::v1::DirectoryRequest request;
+    creek::v1::DirectoryReply reply;
+    grpc::ClientContext ctx;
+    auto status = stub->Directory(&ctx, request, &reply);
+    if (!status.ok()) {
+        std::cerr << "directory failed: " << status.error_message() << std::endl;
+        return 1;
+    }
+    std::cout << "leaf=" << reply.leaf_id() << " node=" << reply.node_id() << std::endl;
+    std::printf("%-24s %-24s %-21s %-16s %-16s %s\n",
+                "SERVICE", "ENDPOINT_ID", "TARGET", "LEAF", "NODE", "ALIVE");
+    for (const auto& ep : reply.endpoints()) {
+        std::printf("%-24s %-24s %-21s %-16s %-16s %s\n",
+                    ep.service().c_str(), ep.endpoint_id().c_str(), ep.target().c_str(),
+                    ep.owner_leaf().c_str(), ep.owner_node().c_str(),
+                    ep.alive() ? "true" : "false");
+    }
+    if (reply.endpoints_size() == 0) std::cout << "  (no endpoints)" << std::endl;
+    return 0;
+}
+
+int metrics(const std::string& target) {    auto channel = grpc::CreateChannel(target, grpc::InsecureChannelCredentials());
     auto stub = creek::v1::Admin::NewStub(channel);
     creek::v1::MetricRequest request;
     request.set_take(true);
@@ -127,6 +151,7 @@ void usage() {
               << "  push-wasm NAME WASM_FILE\n"
               << "  list-wasm\n"
               << "  unload-wasm MODULE_ID\n"
+              << "  directory\n"
               << "  metrics\n";
 }
 
@@ -146,6 +171,8 @@ int main(int argc, char** argv) {
             return list_wasm(target);
         } else if (std::string(argv[i]) == "unload-wasm" && i + 1 < argc) {
             return unload_wasm(target, std::stoi(argv[++i]));
+        } else if (std::string(argv[i]) == "directory") {
+            return directory(target);
         } else if (std::string(argv[i]) == "metrics") {
             return metrics(target);
         }
