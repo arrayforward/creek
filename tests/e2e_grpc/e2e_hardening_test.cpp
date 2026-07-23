@@ -24,6 +24,7 @@
 #include <grpcpp/support/byte_buffer.h>
 
 #include <chrono>
+#include <atomic>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -349,6 +350,7 @@ constexpr int kBackend = 33130;
 constexpr const char* kEchoService = "creek.test.Echo";
 constexpr const char* kEchoMethod = "/creek.test.Echo/Echo";
 constexpr const char* kCountMethod = "/creek.test.Echo/Count";
+constexpr const char* kChatMethod = "/creek.test.Echo/Chat";
 
 creek::test::EchoRequest make_req(const std::string& text, uint32_t seq) {
     creek::test::EchoRequest req;
@@ -356,6 +358,94 @@ creek::test::EchoRequest make_req(const std::string& text, uint32_t seq) {
     req.set_seq(seq);
     return req;
 }
+
+// Long-lived bidi stream on its own CQ + thread: writes continuously (no
+// deadline, like a mediator session) until told to stop or the call ends.
+// Used to prove a stream never hangs forever across a mesh partition.
+struct LongStream {
+    std::atomic<bool> started{false};
+    std::atomic<bool> finished{false};
+    std::atomic<int> echoes{0};
+    std::atomic<bool> stop{false};
+    std::mutex status_mutex;
+    grpc::Status finish_status{grpc::StatusCode::UNKNOWN, "pending"};
+    std::thread th;
+
+    void start(const std::shared_ptr<grpc::Channel>& channel, const std::string& method) {
+        th = std::thread([this, channel, method] { run(channel, method); });
+    }
+    void set_finish(const grpc::Status& st) {
+        {
+            std::lock_guard<std::mutex> lk(status_mutex);
+            finish_status = st;
+        }
+        finished = true;
+    }
+    grpc::Status status() {
+        std::lock_guard<std::mutex> lk(status_mutex);
+        return finish_status;
+    }
+    void run(const std::shared_ptr<grpc::Channel>& channel, const std::string& method) {
+        grpc::ClientContext ctx;  // no deadline, deliberately
+        ctx.AddMetadata("x-session-id", "heal");
+        grpc::CompletionQueue cq;
+        grpc::GenericStub stub(channel);
+        auto rw = stub.PrepareCall(&ctx, method, &cq);
+        if (!rw) { set_finish(grpc::Status(grpc::StatusCode::INTERNAL, "create_failed")); return; }
+        rw->StartCall(reinterpret_cast<void*>(0));
+        void* tag = nullptr;
+        bool ok = false;
+        if (!cq.Next(&tag, &ok) || !ok) {
+            set_finish(grpc::Status(grpc::StatusCode::UNAVAILABLE, "start_failed"));
+            return;
+        }
+        started = true;
+        grpc::ByteBuffer rb;
+        rw->Read(&rb, reinterpret_cast<void*>(9));
+        const std::string payload = make_req("audio", 1).SerializeAsString();
+        bool write_out = false;
+        while (!stop.load()) {
+            if (!write_out) {
+                rw->Write(bb_from_string(payload), reinterpret_cast<void*>(1));
+                write_out = true;
+            }
+            if (!cq.Next(&tag, &ok)) break;
+            if (tag == reinterpret_cast<void*>(1)) {
+                write_out = false;
+                if (!ok) break;  // write side broke; finish below
+            } else if (tag == reinterpret_cast<void*>(9)) {
+                if (ok) {
+                    ++echoes;
+                    rw->Read(&rb, reinterpret_cast<void*>(9));
+                } else {
+                    grpc::Status st;
+                    rw->Finish(&st, reinterpret_cast<void*>(4));
+                    // Drain until the Finish tag itself: other events (e.g.
+                    // an outstanding write) may complete first, and st is
+                    // only assigned once the Finish event is delivered.
+                    while (cq.Next(&tag, &ok)) {
+                        if (tag == reinterpret_cast<void*>(4)) break;
+                    }
+                    set_finish(st);
+                    return;
+                }
+            }
+        }
+        ctx.TryCancel();
+        grpc::Status st;
+        rw->Finish(&st, reinterpret_cast<void*>(4));
+        void* t2 = nullptr;
+        bool o2 = false;
+        while (cq.Next(&t2, &o2)) {
+            if (t2 == reinterpret_cast<void*>(4)) break;
+        }
+        set_finish(st);
+    }
+    void join() {
+        stop = true;
+        if (th.joinable()) th.join();
+    }
+};
 
 TestResult run_hardening_e2e(const std::string& sidecar, const std::string& echo_backend,
                              const std::string& registrar, const std::string& admin_client,
@@ -605,6 +695,124 @@ TestResult run_hardening_e2e(const std::string& sidecar, const std::string& echo
             return {false, result.phase, "owner leaf still sees the dead endpoint"};
         }
         emit_log("dead-removal", "directory converged: dead endpoint removed everywhere");
+    }
+
+    // Phase: mesh partition self-heal (production incident regression).
+    // Chain reproduced: backend dead + node outage longer than the tight
+    // retransmit window -> the stream's Open/Close is permanently lost, the
+    // destination keeps no state, frames vanish. The client stream MUST end
+    // with an error (unknown_stream close / open timeout) instead of
+    // hanging forever, and fresh streams MUST work after recovery.
+    result.phase = "stream-heal";
+    {
+        // Re-register (the dead-removal phase dropped the endpoint) and wait
+        // for the mesh to be callable again.
+        if (spawn("registrar3", log_dir, registrar,
+                  {"--leaf", "127.0.0.1:" + std::to_string(kLeafBGrpc),
+                   "--target", "127.0.0.1:" + std::to_string(kBackend),
+                   "--id", "backend-1", "--service", kEchoService}) < 0) {
+            return {false, result.phase, "registrar3 spawn failed"};
+        }
+        bool callable = false;
+        for (int i = 1; i <= 40 && !callable; ++i) {
+            std::string resp_body;
+            auto status = generic_unary(entry, kEchoMethod, {},
+                                        make_req("probe", 0).SerializeAsString(), &resp_body, 3000);
+            if (status.ok()) callable = true;
+            std::this_thread::sleep_for(std::chrono::milliseconds(500));
+        }
+        if (!callable) return {false, result.phase, "mesh not callable after re-register"};
+
+        LongStream s1;
+        s1.start(entry, kChatMethod);
+        for (int i = 0; i < 100 && s1.echoes.load() < 2 && !s1.finished.load(); ++i) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(100));
+        }
+        if (s1.echoes.load() < 2) {
+            s1.join();
+            return {false, result.phase, "baseline stream did not echo"};
+        }
+        emit_log("stream-heal", "baseline stream echoing; killing node + backend");
+
+        int node_pid = -1, backend_pid = -1;
+        for (const auto& c : g_children) {
+            if (c.tag == "node1") node_pid = c.pid;
+            if (c.tag == "echo_backend") backend_pid = c.pid;
+        }
+        if (node_pid < 0 || backend_pid < 0) {
+            s1.join();
+            return {false, result.phase, "node/backend pid not found"};
+        }
+        kill_pid(backend_pid, SIGKILL);
+        kill_pid(node_pid, SIGKILL);
+        // Outage must exceed the tight retransmit buffer lifetime (30s dead
+        // timeout): afterwards the lost Close can never be replayed, and
+        // post-recovery frames reference a stream the destination no longer
+        // has — exactly the production stuck-forever scenario.
+        emit_log("stream-heal", "partition: 35s (past tight retransmit window)");
+        std::this_thread::sleep_for(std::chrono::seconds(35));
+        if (spawn("node1b", log_dir, sidecar,
+                  {"node", "--id", "node-1",
+                   "--udp", "127.0.0.1:" + std::to_string(kNodeUdp),
+                   "--metrics", "127.0.0.1:" + std::to_string(kNodeMetrics),
+                   "--sync-ms", "200",
+                   "--metric-period-ms", "1000",
+                   "--token", token}) < 0) {
+            s1.join();
+            return {false, result.phase, "node1b spawn failed"};
+        }
+        // The old code left s1 hanging here forever (frames dropped at the
+        // destination for an unknown stream). With self-healing the stream
+        // must end with a non-OK status promptly after the mesh recovers.
+        bool healed_error = false;
+        for (int i = 0; i < 400 && !healed_error; ++i) {
+            if (s1.finished.load()) {
+                healed_error = !s1.status().ok();
+                break;
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(100));
+        }
+        emit_log("stream-heal", std::string("s1 finished=") +
+                 std::to_string(s1.finished.load()) + " code=" +
+                 std::to_string(static_cast<int>(s1.status().error_code())) +
+                 " msg=" + s1.status().error_message());
+        s1.join();
+        if (!healed_error) {
+            return {false, result.phase,
+                    "stream across partition did not fail promptly (stuck-forever regression)"};
+        }
+
+        // Full recovery: restart the backend; fresh streams (client retries,
+        // as a real client would after an error) must eventually echo. The
+        // first attempt may race the leaf->node re-handshake and end with
+        // stream_open_timeout — that is the designed fail-fast path.
+        if (spawn("echo_backend2", log_dir, echo_backend,
+                  {"--id", "backend-1", "--listen", "127.0.0.1:" + std::to_string(kBackend)}) < 0) {
+            return {false, result.phase, "echo_backend2 spawn failed"};
+        }
+        if (!wait_tcp(kBackend, 15000)) {
+            return {false, result.phase, "echo backend2 not listening"};
+        }
+        bool recovered = false;
+        auto retry_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(90);
+        while (!recovered && std::chrono::steady_clock::now() < retry_deadline) {
+            LongStream s2;
+            s2.start(entry, kChatMethod);
+            for (int i = 0; i < 150 && !recovered; ++i) {
+                if (s2.echoes.load() >= 2) recovered = true;
+                if (s2.finished.load()) break;
+                std::this_thread::sleep_for(std::chrono::milliseconds(100));
+            }
+            emit_log("stream-heal", "s2 attempt echoes=" + std::to_string(s2.echoes.load()) +
+                     " finished=" + std::to_string(s2.finished.load()) +
+                     " code=" + std::to_string(static_cast<int>(s2.status().error_code())));
+            s2.join();
+            if (!recovered) std::this_thread::sleep_for(std::chrono::seconds(1));
+        }
+        if (!recovered) {
+            return {false, result.phase, "fresh stream did not recover after node+backend restart"};
+        }
+        emit_log("stream-heal", "partition self-heal ok: prompt error + fresh stream works");
     }
 
     emit_log("done", "ALL CHECKS PASSED");

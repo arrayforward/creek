@@ -32,6 +32,15 @@ class LeafRuntime;
 // How long a proxied stream may sit idle (no frames either way) before the
 // sweeper tears it down.
 inline constexpr std::chrono::seconds kStreamIdleTimeout{120};
+// How long the ingress waits for the first backend-side sign of life (a
+// frame or a close) after opening a stream. Covers a RoutedStreamOpen lost
+// to a mesh outage: without it the stream would hang forever.
+inline constexpr std::chrono::seconds kStreamOpenTimeout{15};
+// Back-pressure bounds. When a client stops reading, the ingress write
+// queue would otherwise grow without limit; likewise for a backend that
+// never starts draining.
+inline constexpr std::size_t kMaxIngressWriteQueue = 256;
+inline constexpr std::size_t kMaxBackendWriteQueue = 1024;
 
 std::string byte_buffer_to_string(grpc::ByteBuffer& bb);
 grpc::ByteBuffer string_to_byte_buffer(const std::string& s);
@@ -69,6 +78,7 @@ struct BackendStream {
     bool half_close_requested{false};
     bool writes_done_sent{false};
     bool finished{false};
+    bool overflow_logged{false};
     grpc::ByteBuffer read_bb;
     grpc::ByteBuffer write_bb;
 
@@ -145,6 +155,12 @@ struct IngressStream : std::enable_shared_from_this<IngressStream> {
     std::string dest_node;
     BackendStream* backend{nullptr};  // local endpoints only
     SteadyClock::time_point last_activity{SteadyClock::now()};
+    // Open-ack tracking: set when the stream is opened (local or remote);
+    // backend_confirmed flips on the first backend-side frame or close. The
+    // sweeper fails streams that stay unconfirmed past kStreamOpenTimeout
+    // (e.g. the RoutedStreamOpen was lost to a mesh partition).
+    SteadyClock::time_point open_sent_at{};
+    bool backend_confirmed{false};
     // Set when the kFinish event arrived; actual map erasure is deferred to
     // the sweeper so late alarm events never dereference freed memory.
     bool dead{false};

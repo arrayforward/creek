@@ -155,8 +155,10 @@ framework::ChangeSet NodeRuntime::Impl::process_batch(const std::vector<framewor
 }
 
 void NodeRuntime::Impl::on_peer_event(const PeerEvent& ev) {
-    std::lock_guard<std::mutex> lk(m_mutex);
+    // Log BEFORE taking m_mutex: write_log is synchronous (global mutex +
+    // fflush) and must not hold the node lock across it.
     CREEK_LOG_INFO(std::string("[runtime] on_peer_event id=") + ev.id + " state=" + std::to_string((int)ev.state));
+    std::lock_guard<std::mutex> lk(m_mutex);
     if (ev.role == LinkRole::Leaf) {
         if (ev.state == LinkState::Closed) {
             auto it = m_leaves.find(ev.id);

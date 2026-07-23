@@ -203,6 +203,9 @@ public:
     std::vector<std::shared_ptr<IngressStream>> m_pending_calls;
     std::unordered_map<std::string, std::shared_ptr<IngressStream>> m_streams;
     std::unordered_map<std::string, BackendStream*> m_backend_streams;
+    // Rate limiter for "unknown_stream" close replies (one per rid per 5s);
+    // entries older than 60s are purged by the sweeper.
+    std::unordered_map<std::string, SteadyClock::time_point> m_unknown_stream_replies;
     std::thread m_grpc_wait_thread;
     // Worker pool that executes inbound routed requests (backend gRPC calls)
     // off the tight transport's single receiver thread.

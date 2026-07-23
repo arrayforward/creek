@@ -35,47 +35,65 @@ void PriorityTimer::schedule_periodic_entry(Task task, std::chrono::milliseconds
 std::vector<Task> PriorityTimer::get_expired_tasks()
 {
     std::vector<Task> tasks;
-    std::lock_guard<std::mutex> lock(m_mutex);
+    // Slow-skip records are logged AFTER the lock is released: write_log is
+    // synchronous (global mutex + fflush per line), and every
+    // schedule_timer_in (e.g. heartbeat_tick re-arming itself) blocks on this
+    // same m_mutex — logging inside the critical section stalls all timer
+    // re-arms for the duration of the log write.
+    struct SlowSkip {
+        std::string name;
+        TaskId id;
+        std::uint64_t elapsed_us;
+    };
+    std::vector<SlowSkip> slow_skips;
+    {
+        std::lock_guard<std::mutex> lock(m_mutex);
 
-    auto now = m_time_source->steady_now();
+        auto now = m_time_source->steady_now();
 
-    while (!m_heap.empty()) {
-        const auto& entry = m_heap.top();
-        if (entry.deadline > now) {
-            break;
-        }
+        while (!m_heap.empty()) {
+            const auto& entry = m_heap.top();
+            if (entry.deadline > now) {
+                break;
+            }
 
-        if (entry.task.skippable()) {
-            auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
-                now - entry.deadline);
-            if (elapsed > m_skip_threshold) {
-                std::string name = entry.task.name();
-                auto task_id = entry.task.id();
+            if (entry.task.skippable()) {
+                auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+                    now - entry.deadline);
+                if (elapsed > m_skip_threshold) {
+                    slow_skips.push_back(SlowSkip{
+                        entry.task.name(),
+                        entry.task.id(),
+                        static_cast<std::uint64_t>(
+                            std::chrono::duration_cast<std::chrono::microseconds>(elapsed).count()),
+                    });
+                    m_heap.pop();
+                    continue;
+                }
+            }
+
+            if (entry.period.count() > 0 && entry.periodic_id != 0) {
+                Task next(entry.task.name(), entry.task.func(), entry.task.priority(), entry.task.skippable());
+                TimerEntry next_entry{std::move(next), now + entry.period, entry.period, entry.periodic_id};
+                tasks.push_back(std::move(entry.task));
                 m_heap.pop();
-                log_slow_task(
-                    name,
-                    task_id,
-                    static_cast<std::uint64_t>(
-                        std::chrono::duration_cast<std::chrono::microseconds>(elapsed).count()),
-                    static_cast<std::uint64_t>(
-                        std::chrono::duration_cast<std::chrono::microseconds>(
-                            m_skip_threshold).count()),
-                    false);
+                m_heap.push(std::move(next_entry));
                 continue;
             }
-        }
 
-        if (entry.period.count() > 0 && entry.periodic_id != 0) {
-            Task next(entry.task.name(), entry.task.func(), entry.task.priority(), entry.task.skippable());
-            TimerEntry next_entry{std::move(next), now + entry.period, entry.period, entry.periodic_id};
             tasks.push_back(std::move(entry.task));
             m_heap.pop();
-            m_heap.push(std::move(next_entry));
-            continue;
         }
-
-        tasks.push_back(std::move(entry.task));
-        m_heap.pop();
+    }
+    for (const auto& skip : slow_skips) {
+        log_slow_task(
+            skip.name,
+            skip.id,
+            skip.elapsed_us,
+            static_cast<std::uint64_t>(
+                std::chrono::duration_cast<std::chrono::microseconds>(
+                    m_skip_threshold).count()),
+            false);
     }
 
     return tasks;

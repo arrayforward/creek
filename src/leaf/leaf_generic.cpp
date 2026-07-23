@@ -195,6 +195,18 @@ void BackendStream::drive_writes_locked() {
 void BackendStream::client_message(std::string bytes) {
     std::lock_guard<std::mutex> lk(m);
     if (finished) return;
+    // Back-pressure bound: a backend that never starts draining (hung or
+    // unreachable without refusing the connection) would grow this queue
+    // without limit. Cancel the call; on_close propagates the failure.
+    if (write_queue.size() >= kMaxBackendWriteQueue) {
+        if (!overflow_logged) {
+            overflow_logged = true;
+            CREEK_LOG_WARN(std::string("[creek-leaf] backend write queue overflow, cancel stream rid=")
+                           + request_id);
+        }
+        ctx.TryCancel();
+        return;
+    }
     write_queue.push_back(std::move(bytes));
     drive_writes_locked();
 }
@@ -641,6 +653,7 @@ void LeafRuntime::Impl::generic_begin_stream(std::shared_ptr<IngressStream> s) {
             std::lock_guard<std::mutex> lk(sp->m);
             sp->remote = false;
             sp->backend = bs;
+            sp->open_sent_at = SteadyClock::now();
         }
         bs->begin();
     } else {
@@ -649,6 +662,7 @@ void LeafRuntime::Impl::generic_begin_stream(std::shared_ptr<IngressStream> s) {
             sp->remote = true;
             sp->dest_leaf = ep.owner_leaf();
             sp->dest_node = ep.owner_node();
+            sp->open_sent_at = SteadyClock::now();
         }
         creek::v1::RoutedStreamOpen open;
         open.set_request_id(sp->request_id);
@@ -714,10 +728,6 @@ void LeafRuntime::Impl::ingress_forward_frame(IngressStream* s, std::string byte
         creek::v1::WireMessage wm;
         *wm.mutable_stream_frame() = frame;
         Bytes payload = serialize_wire(wm);
-        CREEK_LOG_DEBUG(std::string("[creek-leaf] send_frame rid=") + s->request_id
-                        + " hc=" + std::to_string(half_close)
-                        + " bytes=" + std::to_string(bytes.size())
-                        + " dest=" + dest_leaf);
         send_to_mesh(dest_node, dest_leaf, payload, 1);
         return;
     }
@@ -739,27 +749,37 @@ void LeafRuntime::Impl::ingress_forward_frame(IngressStream* s, std::string byte
 void LeafRuntime::Impl::ingress_queue_write(IngressStream* s, std::string bytes) {
     auto hold = find_stream(s->request_id);
     if (!hold) return;
-    std::lock_guard<std::mutex> lk(s->m);
-    if (s->dead || s->finishing) {
-        CREEK_LOG_DEBUG(std::string("[creek-leaf] queue_write_drop rid=") + s->request_id
-                        + " dead=" + std::to_string(s->dead)
-                        + " finishing=" + std::to_string(s->finishing)
-                        + " bytes=" + std::to_string(bytes.size()));
-        return;
+    {
+        std::lock_guard<std::mutex> lk(s->m);
+        if (s->dead || s->finishing) return;
+        s->last_activity = SteadyClock::now();
+        if (s->write_outstanding) {
+            // Back-pressure bound: a client that stops reading would grow
+            // this queue without limit. Fail the stream instead.
+            if (s->write_queue.size() >= kMaxIngressWriteQueue) {
+                s->finish_status = grpc::Status(grpc::StatusCode::RESOURCE_EXHAUSTED,
+                                                "client_read_stall");
+                s->read_stopped = true;
+            } else {
+                s->write_queue.push_back(std::move(bytes));
+                return;
+            }
+        } else {
+            s->write_bb = string_to_byte_buffer(bytes);
+            s->write_outstanding = true;
+            s->rw.Write(s->write_bb, &s->t_write);
+            return;
+        }
     }
-    s->last_activity = SteadyClock::now();
-    if (s->write_outstanding) {
-        s->write_queue.push_back(std::move(bytes));
-        return;
-    }
-    s->write_bb = string_to_byte_buffer(bytes);
-    s->write_outstanding = true;
-    CREEK_LOG_DEBUG(std::string("[creek-leaf] server_write rid=") + s->request_id
-                    + " bytes=" + std::to_string(bytes.size()));
-    s->rw.Write(s->write_bb, &s->t_write);
+    ingress_teardown(hold, grpc::Status(grpc::StatusCode::RESOURCE_EXHAUSTED,
+                                        "client_read_stall"));
 }
 
 void LeafRuntime::Impl::ingress_backend_message(IngressStream* s, std::string bytes) {
+    {
+        std::lock_guard<std::mutex> lk(s->m);
+        s->backend_confirmed = true;
+    }
     ingress_queue_write(s, std::move(bytes));
 }
 
@@ -770,6 +790,7 @@ void LeafRuntime::Impl::ingress_backend_closed(IngressStream* s, const grpc::Sta
         std::lock_guard<std::mutex> lk(s->m);
         if (s->dead || s->finishing) return;
         s->last_activity = SteadyClock::now();
+        s->backend_confirmed = true;
         s->finish_status = status;
         s->read_stopped = true;
         s->backend = nullptr;
@@ -928,26 +949,55 @@ void LeafRuntime::Impl::process_stream_open(const creek::v1::RoutedStreamOpen& o
 }
 
 void LeafRuntime::Impl::process_stream_frame(const creek::v1::RoutedStreamFrame& frame) {
-    CREEK_LOG_DEBUG(std::string("[creek-leaf] stream_frame rid=") + frame.request_id()
-                    + " from_origin=" + std::to_string(frame.from_origin())
-                    + " hc=" + std::to_string(frame.half_close())
-                    + " bytes=" + std::to_string(frame.payload().size()));
     if (frame.from_origin()) {
         // Destination leaf: client -> backend direction.
-        std::lock_guard<std::mutex> lk(m_mutex);
-        auto it = m_backend_streams.find(frame.request_id());
-        if (it == m_backend_streams.end()) return;
-        if (frame.half_close()) {
-            it->second->client_half_close();
-        } else if (!frame.payload().empty()) {
-            it->second->client_message(frame.payload());
+        bool known = false;
+        {
+            std::lock_guard<std::mutex> lk(m_mutex);
+            auto it = m_backend_streams.find(frame.request_id());
+            if (it != m_backend_streams.end()) {
+                known = true;
+                if (frame.half_close()) {
+                    it->second->client_half_close();
+                } else if (!frame.payload().empty()) {
+                    it->second->client_message(frame.payload());
+                }
+            }
+        }
+        if (!known) {
+            // Frame for a stream we never saw open (its RoutedStreamOpen was
+            // lost to a mesh partition) or that is already gone. Tell the
+            // ingress to fail it so the client reconnects instead of hanging
+            // forever. Rate-limited: a flooding client would otherwise turn
+            // every frame into a close packet.
+            auto now = SteadyClock::now();
+            bool reply = false;
+            {
+                std::lock_guard<std::mutex> lk(m_mutex);
+                auto it = m_unknown_stream_replies.find(frame.request_id());
+                if (it == m_unknown_stream_replies.end() ||
+                    now - it->second > std::chrono::seconds(5)) {
+                    m_unknown_stream_replies[frame.request_id()] = now;
+                    reply = true;
+                }
+            }
+            if (reply) {
+                send_stream_close_to(frame.request_id(), frame.origin_leaf(),
+                                     frame.origin_node(), false, -1, "unknown_stream");
+            }
         }
         return;
     }
     // Ingress leaf: backend -> client direction.
     auto hold = find_stream(frame.request_id());
-    if (!hold || frame.payload().empty()) return;
-    ingress_queue_write(hold.get(), frame.payload());
+    if (!hold) {
+        // Our side is gone; make sure the destination side is too.
+        send_stream_close_to(frame.request_id(), frame.origin_leaf(),
+                             frame.origin_node(), true, 1, "unknown_stream");
+        return;
+    }
+    if (frame.payload().empty()) return;
+    ingress_backend_message(hold.get(), frame.payload());
 }
 
 void LeafRuntime::Impl::process_stream_close(const creek::v1::RoutedStreamClose& close) {
@@ -986,6 +1036,7 @@ void LeafRuntime::Impl::stream_sweep_loop() {
         if (!m_running.load()) break;
         const auto now = SteadyClock::now();
         std::vector<std::shared_ptr<IngressStream>> victims;
+        std::vector<std::shared_ptr<IngressStream>> open_timeout_victims;
         std::vector<std::string> dead_ids;
         {
             std::lock_guard<std::mutex> lk(m_mutex);
@@ -1003,17 +1054,40 @@ void LeafRuntime::Impl::stream_sweep_loop() {
                 // mid-Finish no longer owns a live call object. Cancellation
                 // is observed via read/write completions; the idle timeout
                 // is the fallback cleanup.
-                if (!s->finishing && now - s->last_activity > kStreamIdleTimeout) {
+                if (s->finishing) continue;
+                if (now - s->last_activity > kStreamIdleTimeout) {
                     victims.push_back(s);
+                    continue;
+                }
+                // Open-ack timeout: the RoutedStreamOpen may have been lost
+                // to a mesh partition (or the backend call never started).
+                // Without any backend-side sign of life the stream would
+                // hang forever — fail it so the client can reconnect.
+                if (!s->backend_confirmed &&
+                    s->open_sent_at.time_since_epoch().count() != 0 &&
+                    now - s->open_sent_at > kStreamOpenTimeout) {
+                    open_timeout_victims.push_back(s);
                 }
             }
             for (const auto& id : dead_ids) {
                 m_streams.erase(id);
             }
+            for (auto it = m_unknown_stream_replies.begin();
+                 it != m_unknown_stream_replies.end();) {
+                if (now - it->second > std::chrono::seconds(60)) {
+                    it = m_unknown_stream_replies.erase(it);
+                } else {
+                    ++it;
+                }
+            }
         }
         for (auto& s : victims) {
             ingress_teardown(s, grpc::Status(grpc::StatusCode::CANCELLED,
                                              "stream_cancelled_or_idle"));
+        }
+        for (auto& s : open_timeout_victims) {
+            ingress_teardown(s, grpc::Status(grpc::StatusCode::UNAVAILABLE,
+                                             "stream_open_timeout"));
         }
     }
 }

@@ -318,11 +318,13 @@ void LeafRuntime::Impl::on_message(const std::string& peer_id, Bytes payload) {
 }
 
 void LeafRuntime::Impl::on_peer_event(const PeerEvent& ev) {
+    // Log BEFORE taking m_mutex: write_log is synchronous (global mutex +
+    // fflush), and holding m_mutex across it stalls every forwarding and
+    // heartbeat path on this leaf.
+    CREEK_LOG_INFO(std::string("[runtime] leaf on_peer_event id=") + ev.id + " state=" + std::to_string((int)ev.state));
     bool send_snap = false;
     {
         std::lock_guard<std::mutex> lk(m_mutex);
-        CREEK_LOG_INFO(std::string("[runtime] leaf on_peer_event id=") + ev.id + " state=" + std::to_string((int)ev.state) +
-                       " in_parents=" + std::to_string(m_parent_ids.count(ev.id)));
         if (!m_parent_ids.count(ev.id)) return;
         if (ev.state == LinkState::Online) {
             if (m_active_parent.empty()) {
@@ -1061,6 +1063,7 @@ void LeafRuntime::Impl::send_snapshot_to_parent() {
 void LeafRuntime::Impl::do_heartbeat_work() {
     auto now = SteadyClock::now();
     std::vector<creek::v1::Endpoint> dead;
+    std::vector<std::string> removed_ids;
     bool removed_any = false;
     {
         std::lock_guard<std::mutex> lk(m_mutex);
@@ -1078,7 +1081,7 @@ void LeafRuntime::Impl::do_heartbeat_work() {
                     removed.set_version(tomb.version());
                     removed.set_updated_ms(tomb.updated_ms());
                     m_local_tombstones[it->first] = {std::move(removed), unix_millis()};
-                    CREEK_LOG_INFO(std::string("[creek-leaf] endpoint removed ep=") + tomb.endpoint_id());
+                    removed_ids.push_back(tomb.endpoint_id());
                 }
                 it = m_local_endpoints.erase(it);
                 continue;
@@ -1094,6 +1097,10 @@ void LeafRuntime::Impl::do_heartbeat_work() {
         for (auto& ep : dead) {
             m_directory.upsert_local(ep);
         }
+    }
+    // Log outside m_mutex (synchronous write_log must not hold the leaf lock).
+    for (const auto& id : removed_ids) {
+        CREEK_LOG_INFO(std::string("[creek-leaf] endpoint removed ep=") + id);
     }
     if (!dead.empty() || removed_any) {
         send_snapshot_to_parent();
